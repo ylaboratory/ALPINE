@@ -327,8 +327,8 @@ class ALPINE:
                     # W_denominator += self.alpha_W * torch.ones_like(W_denominator)
 
                     # orthogonal constraint
-                    # W_denominator = W @ (H_sub @ H_sub.T + orthogonal_matrix)
-                    W_denominator = W @ (H_sub @ H_sub.T + self.alpha_W * (torch.ones_like(H_sub @ H_sub.T) - torch.eye(H_sub.shape[0], device=device)))
+                    W_denominator = W @ (H_sub @ H_sub.T + orthogonal_matrix)
+                    # W_denominator = W @ (H_sub @ H_sub.T + self.alpha_W * (torch.ones_like(H_sub @ H_sub.T) - torch.eye(H_sub.shape[0], device=device)))
 
 
 
