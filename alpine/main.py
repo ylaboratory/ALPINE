@@ -33,16 +33,15 @@ class ALPINE:
         self.alpha_W = alpha_W
         self.random_state = random_state
         self.gpu = gpu
+        self.device = torch.device("cuda" if self.gpu and torch.cuda.is_available() else "cpu")
         self.loss_type = loss_type
         self.eps = eps
         self.n_all_components = self.n_covariate_components + [self.n_components]
         self.total_components = sum(self.n_covariate_components) + self.n_components
         self.lam = self._process_lam(lam)
-        self._check_params()
         self.scale_needed = scale_needed
-        self.Ws = kwargs.get('Ws', None)
-        self.Hs = kwargs.get('Hs', None)
-        self.Bs = kwargs.get('Bs', None)
+        self._check_params()
+
 
     def fit(
             self, X: ad.AnnData, 
@@ -50,15 +49,21 @@ class ALPINE:
             max_iter: Optional[int] = None,
             batch_size: Optional[int] = None, 
             sample_weights: bool = True,
-            verbose: bool = True
+            verbose: bool = True,
+            **kwargs
         ) -> None:
         
         self.max_iter = max_iter
         self.X, self.y_input, self.condition_names = self._process_input(X, covariate_keys)
-        self.y, self.y_labels = zip(*[self._to_dummies(yi) for yi in self.y_input])
+        self.y, self.y_labels, self.M_y = zip(*[self._to_dummies(yi) for yi in self.y_input])
         self.batch_size = batch_size if batch_size is not None else int(self.X.shape[1] / 3)
         self._check_input()
         
+        self.Ws = kwargs.get('Ws', None)
+        self.Hs = kwargs.get('Hs', None)
+        self.Bs = kwargs.get('Bs', None)
+        self._check_decomposed_matrices()
+
         # Automatically search for the best max_iter if not provided
         if max_iter is None:
             # for the scanning purpose
@@ -182,7 +187,6 @@ class ALPINE:
         if self.random_state is not None and not isinstance(self.random_state, int):
             raise ValueError("random_state must be None or an integer")
 
-        
 
     def _check_input(self):
         if not isinstance(self.X, np.ndarray) or self.X.ndim != 2:
@@ -194,8 +198,33 @@ class ALPINE:
             raise ValueError("Number of batch components must match the number of y matrices.")
         if any(yi.shape[1] != self.X.shape[1] for yi in self.y):
             raise ValueError("All y matrices must have the same number of columns as X.")
-    
-    
+
+
+    def _check_decomposed_matrices(self):
+        n_feature, n_sample = self.X.shape
+
+        if self.Ws is not None:
+            self.Ws = [torch.tensor(w, dtype=torch.float32, device=self.device) for w in self.Ws]
+        else:
+            self.Ws = [torch.rand((n_feature, k), dtype=torch.float32, device=self.device) for k in self.n_all_components]
+            
+        if self.Hs is not None:
+            self.Hs = [torch.tensor(h, dtype=torch.float32, device=self.device) for h in self.Hs]
+        else:
+            self.Hs = [torch.rand((k, n_sample), dtype=torch.float32, device=self.device) for k in self.n_all_components]
+
+        if self.Bs is not None:
+            self.Bs = [torch.tensor(b, dtype=torch.float32, device=self.device) for b in self.Bs]
+        else:
+            self.Bs = [torch.rand((_y.shape[0], k), dtype=torch.float32, device=self.device) for (_y, k) in zip(self.y, self.n_covariate_components)]
+
+        self.M_y = [torch.tensor(m, dtype=torch.float32, device=self.device) for m in self.M_y]
+
+    def _check_non_negative(self, X):
+        if not np.all(X >= 0):
+            return False
+
+
     def _process_lam(self, lam):
         if lam is None:
             return None
@@ -222,13 +251,18 @@ class ALPINE:
     def _to_dummies(self, y):
         dummies_df = pd.get_dummies(y, dtype=float)
         labels = dummies_df.columns.tolist()
+        mask = np.ones_like(dummies_df.values, dtype=float)
+        mask[dummies_df.sum(axis=1) == 0] = 0
 
-        return dummies_df.values.T, labels
+        return dummies_df.values.T, labels, mask.T
 
     def _to_dummies_from_train (self, i, y):
         dummies_df = pd.get_dummies(y, dtype=float)
         dummies_df = dummies_df.reindex(columns=self.y_labels[i], fill_value=0)
-        return dummies_df.values.T
+        mask = np.ones_like(dummies_df.values, dtype=float)
+        mask[dummies_df.sum(axis=1) == 0] = 0
+
+        return dummies_df.values.T, mask.T
     
 
     def _kl_divergence(self, y, y_hat):
@@ -245,37 +279,19 @@ class ALPINE:
         return kneedle.elbow
     
 
-
     def _fit(self, sample_weights, verbose):
-        device = torch.device("cuda" if self.gpu and torch.cuda.is_available() else "cpu")
 
         if self.random_state is not None:
             torch.manual_seed(self.random_state)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(self.random_state)
 
-        X = torch.tensor(self.X, dtype=torch.float32, device=device)
-        n_feature, n_sample = X.shape
+        X = torch.tensor(self.X, dtype=torch.float32, device=self.device)
+        n_sample = X.shape[1]
+        y = [torch.tensor(y, dtype=torch.float32, device=self.device) for y in self.y]
 
-        y = [torch.tensor(y, dtype=torch.float32, device=device) for y in self.y]
+        Ws, Hs, Bs, M_y = deepcopy(self.Ws), deepcopy(self.Hs), deepcopy(self.Bs), deepcopy(self.M_y)
 
-        if self.Ws is not None:
-            Ws = [torch.tensor(w, dtype=torch.float32, device=device) for w in self.Ws]
-        else:
-            Ws = [torch.rand((n_feature, k), dtype=torch.float32, device=device) for k in self.n_all_components]
-            
-        if self.Hs is not None:
-            Hs = [torch.tensor(h, dtype=torch.float32, device=device) for h in self.Hs]
-        else:
-            Hs = [torch.rand((k, n_sample), dtype=torch.float32, device=device) for k in self.n_all_components]
-
-        # B matrix for each covariate component
-        if self.Bs is not None:
-            Bs = [torch.tensor(b, dtype=torch.float32, device=device) for b in self.Bs]
-        else:
-            Bs = [torch.rand((_y.shape[0], k), dtype=torch.float32, device=device) for (_y, k) in zip(y, self.n_covariate_components)]
-
-        
         if self.lam is None:
             W = torch.cat(Ws, dim=1)
             H = torch.cat(Hs, dim=0)
@@ -290,15 +306,14 @@ class ALPINE:
         loss_history = []
 
         # orthogonal constraint
-        # W = torch.cat(Ws, dim=1)
-        # orthogonal_matrix = torch.zeros((W.shape[1], W.shape[1]), dtype=torch.float32, device=device)
-        # start_idx = 0
-        # for i in range(len(self.n_all_components)):
-        #     end_idx = start_idx + Ws[i].shape[1]
-        #     k = Ws[i].shape[1]
-        #     weights = self.alpha_W * (W.shape[1] / k)
-        #     orthogonal_matrix[start_idx:end_idx, start_idx:end_idx] = weights * torch.ones(k, k, device=device) - torch.eye(k, device=device)
-        #     start_idx = end_idx
+        orthogonal_matrix = torch.zeros((self.total_components, self.total_components), dtype=torch.float32, device=self.device)
+        start_idx = 0
+        for i in range(len(self.n_all_components)):
+            end_idx = start_idx + Ws[i].shape[1]
+            k = Ws[i].shape[1]
+            weights = self.alpha_W * (self.total_components / k)
+            orthogonal_matrix[start_idx:end_idx, start_idx:end_idx] = weights * torch.ones(k, k, device=self.device) - torch.eye(k, device=self.device)
+            start_idx = end_idx
 
         pbar = tqdm(total=self.max_iter, desc="Epoch", ncols=150) if verbose else nullcontext()
         with pbar:
@@ -307,14 +322,15 @@ class ALPINE:
                     if isinstance(sample_weights, bool) and sample_weights:
                         joint_labels = ["+".join(str(y.iloc[j]) for y in self.y_input) for j in range(len(self.y_input[0]))]
                         sample_weights = compute_sample_weight(class_weight='balanced', y=joint_labels)
-                        sample_weights = torch.tensor(sample_weights / np.sum(sample_weights), dtype=torch.float32, device=device)
+                        sample_weights = torch.tensor(sample_weights / np.sum(sample_weights), dtype=torch.float32, device=self.device)
                         indices = torch.multinomial(sample_weights, min(self.batch_size, len(sample_weights)), replacement=False)
                     else:
-                        indices = torch.randperm(n_sample, device=device)[:self.batch_size]
+                        indices = torch.randperm(n_sample, device=self.device)[:self.batch_size]
 
                     X_sub = X[:, indices]
                     Hs_sub = [h[:, indices] for h in Hs]
                     y_sub = [_y[:, indices] for _y in y]
+                    M_y_sub = [m[:, indices] for m in M_y]
 
                     # update W
                     W = torch.cat(Ws, dim=1)
@@ -328,7 +344,7 @@ class ALPINE:
 
                     # orthogonal constraint
                     W_denominator = W @ (H_sub @ H_sub.T + orthogonal_matrix)
-                    # W_denominator = W @ (H_sub @ H_sub.T + self.alpha_W * (torch.ones_like(H_sub @ H_sub.T) - torch.eye(H_sub.shape[0], device=device)))
+                    # W_denominator = W @ (H_sub @ H_sub.T + self.alpha_W * (torch.ones_like(H_sub @ H_sub.T) - torch.eye(H_sub.shape[0], device=self.device)))
 
 
 
@@ -340,13 +356,13 @@ class ALPINE:
                         Ws[idx] = W[:, start_idx:end_idx]
                         start_idx = end_idx
 
-                    for b, (y_b, B_b, H_b) in enumerate(zip(y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
+                    for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
                         if self.loss_type == "kl-divergence":
-                            B_numerator = torch.div(y_b, torch.clamp(B_b @ H_b, min=self.eps)) @ H_b.T
+                            B_numerator = torch.div((M * y_b), torch.clamp(M * (B_b @ H_b), min=self.eps)) @ H_b.T
                             B_denominator = torch.ones_like(y_b) @ H_b.T
                         else:
-                            B_numerator = y_b @ H_b.T
-                            B_denominator = B_b @ H_b @ H_b.T
+                            B_numerator = (M * y_b) @ H_b.T
+                            B_denominator = (M * (B_b @ H_b)) @ H_b.T
 
                         Bs[b] *= torch.div(torch.clamp(B_numerator, min=self.eps), torch.clamp(B_denominator, min=self.eps))
 
@@ -355,14 +371,14 @@ class ALPINE:
                     H_label_denominator = torch.zeros_like(H_sub) + self.eps
 
                     start_idx = 0
-                    for b, (y_b, B_b, H_b) in enumerate(zip(y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
+                    for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
                         end_idx = start_idx + H_b.shape[0]
                         if self.loss_type == "kl-divergence":
-                            H_numerator = self.lam[b] * B_b.T @ torch.div(y_b, torch.clamp(B_b @ H_b, min=self.eps))
+                            H_numerator = self.lam[b] * B_b.T @ torch.div((M * y_b), torch.clamp(M *(B_b @ H_b), min=self.eps))
                             H_denominator = self.lam[b] * B_b.T @ torch.ones_like(y_b)
                         else:
-                            H_numerator = 2 * self.lam[b] * B_b.T @ y_b
-                            H_denominator = 2 * self.lam[b] * B_b.T @ B_b @ H_b
+                            H_numerator = 2 * self.lam[b] * B_b.T @ (M * y_b)
+                            H_denominator = 2 * self.lam[b] * B_b.T @ (M * (B_b @ H_b))
 
                         H_label_numerator[start_idx:end_idx] += H_numerator
                         H_label_denominator[start_idx:end_idx] += H_denominator
@@ -395,10 +411,13 @@ class ALPINE:
                 else:
                     label_loss = [torch.norm(_y - _b @ _h, 'fro')**2 for _y, _b, _h in zip(y, Bs, Hs)]
 
-                label_loss = [self.lam[i] * ll for i, ll in enumerate(label_loss)]
-                label_total_loss = torch.sum(torch.stack(label_loss))
+                weighted_label_loss = [self.lam[i] * ll for i, ll in enumerate(label_loss)]
+                label_total_loss = torch.sum(torch.stack(weighted_label_loss))
                 loss = recon_loss + label_total_loss
-                loss_history.append([recon_loss.item()] + [l.item() for l in label_loss] + [loss.item()])
+                loss_history.append([recon_loss.item()] + [l.item() for l in weighted_label_loss] + [loss.item()])
+
+                # update lambda
+                # self.lam = [torch.clamp(self.lam[i]-0.01*torch.log(1 + label_loss[i]), min=self.eps).item() for i in range(len(self.lam))]
 
                 if verbose:
                     pbar.set_postfix({"objective loss": loss.item()})
@@ -424,21 +443,18 @@ class ALPINE:
             batch_size = None,
             lam = None
         ):
-        
-        device = torch.device("cuda" if self.gpu and torch.cuda.is_available() else "cpu")
-        
         y = self.condition_names
         X_new, y_new_input, _ = self._process_input(X, y)
-        y_new = [self._to_dummies_from_train(i, yi) for i, yi in enumerate(y_new_input)]
+        y_new, M_y = zip(*[self._to_dummies_from_train(i, yi) for i, yi in enumerate(y_new_input)])
 
-        X_new = torch.tensor(X_new, dtype=torch.float32, device=device)
-        y_new = [torch.tensor(yi, dtype=torch.float32, device=device) for yi in y_new]
-        Bs = [torch.tensor(b, dtype=torch.float32, device=device) for b in self.Bs]
-        Ws = [torch.tensor(w, dtype=torch.float32, device=device) for w in self.Ws]
+        X_new = torch.tensor(X_new, dtype=torch.float32, device=self.device)
+        y_new = [torch.tensor(yi, dtype=torch.float32, device=self.device) for yi in y_new]
+        Bs = [torch.tensor(b, dtype=torch.float32, device=self.device) for b in self.Bs]
+        Ws = [torch.tensor(w, dtype=torch.float32, device=self.device) for w in self.Ws]
         W = torch.cat(Ws, dim=1)
 
         n_sample = X_new.shape[1]
-        Hs_new = [torch.rand((k, n_sample), dtype=torch.float32, device=device) for k in self.n_all_components]
+        Hs_new = [torch.rand((k, n_sample), dtype=torch.float32, device=self.device) for k in self.n_all_components]
         H_new = torch.cat(Hs_new, dim=0)
 
         if lam is None:
@@ -457,25 +473,26 @@ class ALPINE:
             batch_size = int(n_sample / 3)
         for _ in range(n_iter):
             for _ in range(0, n_sample, batch_size):
-                indices = torch.randperm(n_sample, device=device)[:batch_size]
+                indices = torch.randperm(n_sample, device=self.device)[:batch_size]
 
                 X_sub = X_new[:, indices]
                 Hs_sub = [h[:, indices] for h in Hs_new]
                 y_sub = [_y[:, indices] for _y in y_new]
                 H_sub = torch.cat(Hs_sub, dim=0)
+                M_y_sub = [m[:, indices] for m in M_y]
 
-                H_label_numerator = torch.zeros_like(H_sub, device=device)
-                H_label_denominator = torch.zeros_like(H_sub, device=device)
+                H_label_numerator = torch.zeros_like(H_sub, device=self.device)
+                H_label_denominator = torch.zeros_like(H_sub, device=self.device)
                 
                 start_idx = 0
-                for b, (y_b, B_b, H_b) in enumerate(zip(y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
+                for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
                     end_idx = start_idx + H_b.shape[0]
                     if self.loss_type == "kl-divergence":
-                        H_numerator = lam[b] * B_b.T @ torch.div(y_b, torch.clamp(B_b @ H_b, min=self.eps))
+                        H_numerator = lam[b] * B_b.T @ torch.div(M * y_b, torch.clamp(M * (B_b @ H_b), min=self.eps))
                         H_denominator = lam[b] * B_b.T @ torch.ones_like(y_b)
                     else:
-                        H_numerator = 2 * lam[b] * B_b.T @ y_b
-                        H_denominator = 2 * lam[b] * B_b.T @ B_b @ H_b
+                        H_numerator = 2 * lam[b] * B_b.T @ (M * y_b)
+                        H_denominator = 2 * lam[b] * B_b.T @ (M * (B_b @ H_b))
                     
                     H_label_numerator[start_idx:end_idx] += H_numerator
                     H_label_denominator[start_idx:end_idx] += H_denominator

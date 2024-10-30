@@ -63,8 +63,9 @@ class ComponentOptimizer:
         # Calculate the score
         score = 0
         for key in self.covariate_keys:
-            score += adjusted_rand_score(adata.obs[key], adata.obs["leiden"])
-            score += homogeneity_score(adata.obs[key], adata.obs["leiden"])
+            selected_idx = ~adata.obs[key].isna()
+            score += adjusted_rand_score(adata.obs[key][selected_idx], adata.obs["leiden"][selected_idx])
+            score += homogeneity_score(adata.obs[key][selected_idx], adata.obs["leiden"][selected_idx])
         score /= len(self.covariate_keys)
         
         return score
@@ -298,144 +299,5 @@ class ComponentOptimizer:
             gpu = self.gpu,
             
         )
-
+        model.fit(X=self.adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, batch_size=self.batch_size, verbose=False)
         return model
-    
-
-
-
-
-
-
-    # def calc_ari(self, args):
-
-    #     n_covariate_components = args['n_covariate_components']
-    #     n_components = args['n_components']
-    #     lam = [10**lam for lam in args['lam']]
-    #     alpha_W = args['alpha_W']
-
-    #     self.train_history['n_covariate_components'].append(n_covariate_components)
-    #     self.train_history['n_components'].append(n_components)
-    #     self.train_history['lam'].append(lam)
-    #     self.train_history['alpha_W'].append(args['alpha_W'])
-
-
-    #     model = ALPINE (
-    #         n_covariate_components = n_covariate_components,
-    #         n_components = n_components,
-    #         lam = lam,
-    #         alpha_W = alpha_W,
-    #         random_state = self.random_state,
-    #         loss_type = self.loss_type,
-    #         gpu = self.gpu,
-
-    #     )
-
-    #     # Fit the model on the training data
-    #     model.fit(X=self.adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, batch_size=self.batch_size, verbose=False)
-    #     model.store_embeddings(self.adata)
-    #     self.max_iter = model.max_iter
-
-    #     sc.pp.neighbors(self.adata, use_rep='ALPINE_embedding')
-    #     sc.tl.leiden(self.adata, flavor="igraph")
-
-    #     # calculate the score
-    #     score = 0
-    #     for key in self.covariate_keys:
-    #         score += adjusted_rand_score(self.adata.obs[key], self.adata.obs["leiden"])
-    #         score += homogeneity_score(self.adata.obs[key], self.adata.obs["leiden"])
-
-    #     self.train_history['score'].append(score)
-    #     return score
-
-
-    # def bayesian_search(
-    #         self,
-    #         n_components_range = (30, 60),
-    #         n_covariate_range = (10, 30),
-    #         step = 5,
-    #         lam_range:Tuple = (1, 5),
-    #         alpha_W_range = (0, 0.5),
-    #         max_evals=50
-    #     ):
-
-    #     iter_records = []
-
-    #     def objective(space):
-    #         # Handle multiple covariate components separately
-    #         lam = [space[f'lam_{i}'] for i in range(len(self.covariate_keys))]
-    #         n_covariate_components = [int(space[f'n_covariate_{i}']) for i in range(len(self.covariate_keys))]
-
-    #         # Check constraint: n_components >= sum(n_covariate_components)
-    #         if space['n_components'] < sum(n_covariate_components):
-    #             return {'status': STATUS_FAIL}  # Skip this evaluation
-
-    #         args = {
-    #             'n_components': int(space['n_components']),
-    #             'n_covariate_components': n_covariate_components,
-    #             'lam': lam,
-    #             'alpha_W': space['alpha_W']
-    #         }
-    #         score = self.calc_ari(args)
-
-    #         if len(iter_records) < 10:
-    #             iter_records.append(self.max_iter)
-    #             self.max_iter = None
-    #         else:
-    #             self.max_iter = max(iter_records)
-
-    #         loss = score
-    #         return {'loss': loss, 'status': STATUS_OK}
-
-    #     # Define the search space for Bayesian Optimization
-    #     space = {
-    #         'n_components': hp.quniform('n_components', n_components_range[0], n_components_range[1], step),
-    #         'alpha_W': hp.uniform('alpha_W', alpha_W_range[0], alpha_W_range[1])
-    #     }
-
-    #     # Add individual n_covariate_component ranges for each covariate key
-    #     for i in range(len(self.covariate_keys)):
-    #         space[f'lam_{i}'] = hp.uniform(f'lam_{i}', lam_range[0], lam_range[1])
-    #         space[f'n_covariate_{i}'] = hp.quniform(f'n_covariate_{i}', n_covariate_range[0], n_covariate_range[1], step)
-
-    #     # Run the optimization using TPE
-    #     trials = Trials()
-    #     best = fmin(objective, space, algo=tpe.suggest, max_evals=max_evals, trials=trials)
-
-
-    #     # Sort the training history by score in descending order
-    #     sorted_indices = np.argsort(self.train_history["score"])[::-1]
-    #     for key in self.train_history:
-    #         self.train_history[key] = [self.train_history[key][i] for i in sorted_indices]
-
-    #     # # Use KneeLocator to find the elbow point in the sorted scores
-    #     kneedle = KneeLocator(
-    #         np.arange(len(self.train_history['score'])), 
-    #         self.train_history['score'], 
-    #         curve='convex', 
-    #         direction='decreasing'
-    #     )
-
-    #     best_idx = kneedle.elbow
-    #     mininum_all_components = sum(self.train_history['n_covariate_components'][best_idx]) / self.train_history['n_components'][best_idx]
-
-    #     # # Iterate over the sorted scores to find the best index with minimum n_covariate_components
-    #     for idx in range(best_idx, len(self.train_history['score'])):
-    #         current_all_components = sum(self.train_history['n_covariate_components'][idx]) / self.train_history['n_components'][idx]
-    #         if current_all_components < mininum_all_components:
-    #             best_idx = idx
-    #             mininum_all_components = current_all_components
-
-    #     # Set the best parameters
-    #     self.best_param['n_components'] = int(best['n_components'])
-    #     self.best_param['n_covariate_components'] = [int(best[f'n_covariate_{i}']) for i in range(len(self.covariate_keys))]
-    #     self.best_param['lam'] = [float(10**best[f'lam_{i}']) for i in range(len(self.covariate_keys))]
-    #     self.best_param['alpha_W'] = best['alpha_W']
-
-    #     self.minimum_set_param['n_components'] = self.train_history['n_components'][best_idx]
-    #     self.minimum_set_param['n_covariate_components'] = self.train_history['n_covariate_components'][best_idx]
-    #     self.minimum_set_param['lam'] = self.train_history['lam'][best_idx]
-    #     self.minimum_set_param['alpha_W'] = best['alpha_W']
-
-    #     self.trials = trials
-    #     return self.best_param
