@@ -63,12 +63,11 @@ With ALPINE, you have the flexibility to either manually define the parameters y
 ```python
 # user can maually specify desired paramteres
 alpine_model = ALPINE(
-    n_covariate_components: Union[List[int], int] ,
-        n_components = 30,
-        n_covariate_components = [5, 5] 
-        alpha_W = 0,
-        lam = [1e+3, 1e+3],
-        gpu = True
+    n_components = 30,
+    n_covariate_components = [5, 5] 
+    alpha_W = 0,
+    lam = [1e+3, 1e+3],
+    gpu = True
 )
 alpine_model.fit(adata, covariate_keys=["cov_1", "cov_2"])
 ```
