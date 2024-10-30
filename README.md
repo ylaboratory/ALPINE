@@ -72,7 +72,7 @@ alpine_model = ALPINE(
 alpine_model.fit(adata, covariate_keys=["cov_1", "cov_2"])
 ```
 
-2.  **Using optimized parameters from `ComponentOptimizer`:**
+2.  **Using optimized parameters from `ComponentOptimizer` (Recommend):**
 
 ```python
 # if you use the ComponentOptimizer, you can simply plugin the parameteres learned from the last step
@@ -88,20 +88,22 @@ alpine_model.store_embedding(adata)
 # the H embedding can be retrieved by
 alpine_model.obsm["ALPINE_embedding"] # unguided embedding
 alpine_model.obsm["cov_1"] # covariate embedding
+alpine_model.obsm["cov_2"] # covariate embedding
 
 # the W embedding
 alpine_model.varm["ALPINE_embedding"] # unguided gene signature embedding
 alpine_model.varm["cov_1"] # covariate gene signature embedding
+alpine_model.varm["cov_2"] # covariate gene signature embedding
 
 ```
 #### b. Get the decomposed matrices and counts
 
-In addition to obtaining embeddings from `adata`, users can also retrieve the decomposed matrices from the ALPINE model by using:
+In addition to obtaining embeddings from `adata`, users can also retrieve the decomposed matrices from the `ALPINE` model by using:
 
 ```python
 Ws, Hs, Bs = alpine_model.get_decomposed_matrices()
 ```
-The order of the matrices in Ws and Hs follows the sequence of the covariate keys, with the unguided embeddings placed at the end. In contrast, the Bs matrices do not include the unguided portion; their order strictly adheres to the covariate keys.
+The order of the matrices in `Ws` and `Hs` follows the sequence of the covariate keys, with the unguided embeddings placed at the end. In contrast, the `Bs` matrices do not include the unguided portion; their order strictly adheres to the covariate keys.
 
 To obtain the normalized counts that are free from batch effects and conditions, where:
 
@@ -112,7 +114,7 @@ alpine_model.get_normalized_expression(adata)
 adata.obsm["normalized_expression"]
 ```
 
-There are more usages of our model, please check the next section.
+There are additional applications for our model; please refer to the next section for more details.
 
 ## More usage, and analysis
 
