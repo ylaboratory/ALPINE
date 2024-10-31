@@ -17,6 +17,7 @@ Currently, `ALPINE` is not yet available on the PyPI repository. However, users 
 # in the alpine folder
 pip install -e .
 ```
+The ALPINE is implemented using the PyTorch where user has to install the package by themself for supporting different CUDA or CPU version.
 
 ## Usage
 

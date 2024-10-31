@@ -17,7 +17,7 @@ scikit-learn = "^1.5.2"
 tqdm = "^4.66.5"
 hyperopt = "^0.2.7"
 pandas = "^2.2.3"
-torch = {version = "^2.4.1+cu124", source = "pytorch"}
+#torch = {version = "^2.4.1+cu124", source = "pytorch"}
 kneed = "^0.8.5"
 
 [[tool.poetry.source]]
