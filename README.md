@@ -1,5 +1,6 @@
-# ALPINE (Adaptive Layering of Phenotypic and Integrative Noise Extraction)
+# ALPINE
 
+**ALPINE: Adaptive Layering of Phenotypic and Integrative Noise Extraction**
 
 `ALPINE` is a semi-supervised non-negative matrix factorization (NMF) framework designed to effectively distinguish between multiple phenotypic conditions based on shared biological factors, while also providing direct interpretability of condition-associated genes. The entire package is developed in Python and supports GPU usage, significantly enhancing computational speed.
 

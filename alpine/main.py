@@ -19,6 +19,7 @@ class ALPINE:
         n_covariate_components: Union[List[int], int] ,
         n_components: int = 30,
         alpha_W = 0,
+        orth_W = 0,
         lam: Optional[Union[List[float], List[int], float, int]] = None,
         gpu: bool = True,
         scale_needed: bool = True,
@@ -31,6 +32,7 @@ class ALPINE:
         self.n_components = n_components
         self.n_covariate_components = [n_covariate_components] if isinstance(n_covariate_components, int) else n_covariate_components
         self.alpha_W = alpha_W
+        self.orth_W= orth_W
         self.random_state = random_state
         self.gpu = gpu
         self.device = torch.device("cuda" if self.gpu and torch.cuda.is_available() else "cpu")
@@ -311,7 +313,7 @@ class ALPINE:
         for i in range(len(self.n_all_components)):
             end_idx = start_idx + Ws[i].shape[1]
             k = Ws[i].shape[1]
-            weights = self.alpha_W * (self.total_components / k)
+            weights = self.orth_W * (self.total_components / k)
             orthogonal_matrix[start_idx:end_idx, start_idx:end_idx] = weights * torch.ones(k, k, device=self.device) - torch.eye(k, device=self.device)
             start_idx = end_idx
 
@@ -339,11 +341,14 @@ class ALPINE:
                     W_numerator = X_sub @ H_sub.T
                     # W_denominator = W @ H_sub @ H_sub.T
 
-                    # l1 norm
-                    # W_denominator += self.alpha_W * torch.ones_like(W_denominator)
 
                     # orthogonal constraint
                     W_denominator = W @ (H_sub @ H_sub.T + orthogonal_matrix)
+
+                    # l1 norm
+                    W_denominator += self.alpha_W * torch.ones_like(W_denominator)
+
+                    # orthogonal on the entire W
                     # W_denominator = W @ (H_sub @ H_sub.T + self.alpha_W * (torch.ones_like(H_sub @ H_sub.T) - torch.eye(H_sub.shape[0], device=self.device)))
 
 

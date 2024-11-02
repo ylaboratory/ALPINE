@@ -40,12 +40,14 @@ class ComponentOptimizer:
         n_components = args['n_components']
         lam = [10**lam for lam in args['lam']]
         alpha_W = args['alpha_W']
+        orth_W = args['orth_W']
 
         model = ALPINE(
             n_covariate_components=n_covariate_components,
             n_components=n_components,
             lam=lam,
             alpha_W=alpha_W,
+            orth_W=orth_W,
             random_state=self.random_state,
             loss_type=self.loss_type,
             gpu=self.gpu,
@@ -97,7 +99,8 @@ class ComponentOptimizer:
             'n_components': n_components,
             'n_covariate_components': n_covariate_components,
             'lam': lam,
-            'alpha_W': space['alpha_W']
+            'alpha_W': space['alpha_W'],
+            'orth_W': space['orth_W']
         }
 
         score = self.calc_ari(args)
@@ -107,6 +110,7 @@ class ComponentOptimizer:
             'n_covariate_components': n_covariate_components,
             'lam': [10**l for l in lam],
             'alpha_W': space['alpha_W'],
+            'orth_W': space['orth_W'],
             'max_iter': self.max_iter,
             'score': score
         }
@@ -125,7 +129,8 @@ class ComponentOptimizer:
             self,
             n_total_components_range=(50, 100),
             lam_power_range=(1, 5),
-            alpha_W_range=(0, 0.5),
+            alpha_W_range=(0, 1),
+            orth_W_range=(0, 1),
             max_evals=50,
             min_components=None,
             trials_filename=None
@@ -157,6 +162,7 @@ class ComponentOptimizer:
             # Ensure n_components is at least 50% of n_total_components
             'n_all_components': hp.quniform('n_all_components', n_total_components_range[0], n_total_components_range[1], 1),
             'alpha_W': hp.uniform('alpha_W', alpha_W_range[0], alpha_W_range[1]),
+            'orth_W': hp.uniform('orth_W', orth_W_range[0], orth_W_range[1]),
         }
 
         # Distribute the remaining space across covariate components
@@ -176,6 +182,7 @@ class ComponentOptimizer:
         self.best_param['n_covariate_components'] = n_covariate_components
         self.best_param['lam'] = [float(10**best[f'lam_{i}']) for i in range(len(self.covariate_keys))]
         self.best_param['alpha_W'] = best['alpha_W']
+        self.best_param['orth_W'] = best['orth_W']
 
         return self.best_param
 
@@ -211,6 +218,7 @@ class ComponentOptimizer:
         self.best_param['n_covariate_components'] = n_covariate_components
         self.best_param['lam'] = [float(10**best[f'lam_{i}']) for i in range(len(self.covariate_keys))]
         self.best_param['alpha_W'] = best['alpha_W']
+        self.best_param['orth_W'] = best['orth_W']
         
         return self.best_param
 
