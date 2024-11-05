@@ -125,7 +125,7 @@ class ComponentOptimizer:
         else:
             self.max_iter = max(self.iter_records)
 
-        loss = score #+ 0.1 * (sum(n_covariate_components)/(sum(n_covariate_components) + n_components))
+        loss = score + self.weight_reduce_covar_dims * (sum(n_covariate_components)/(sum(n_covariate_components) + n_components))
         return {'loss': loss, 'status': STATUS_OK, 'params': trial_history}
     
 
@@ -136,6 +136,7 @@ class ComponentOptimizer:
             alpha_W_range=(0, 1),
             orth_W_range=(0, 0.5),
             l1_ratio_range=(0, 1),
+            weight_reduce_covar_dims = 0,
             max_evals=50,
             min_components=None,
             trials_filename=None
@@ -153,7 +154,7 @@ class ComponentOptimizer:
         if any(comp < 2 for comp in min_components):
             raise ValueError("min_components should be greater than or equal to 2.")
         self.min_components = min_components
-
+        self.weight_reduce_covar_dims = weight_reduce_covar_dims
         self.iter_records = []
 
         # Load previous trials if specified

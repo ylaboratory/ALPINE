@@ -40,7 +40,7 @@ ALPINE integrates a Bayesian optimizer to efficiently search for all necessary h
 from alpine import ComponentOptimizer
 
 # create optimization object with data and covariate keys
-co = co.ComponentOptimizer(adata, covariate_keys=["cov_1", "cov_2"])
+co = ComponentOptimizer(adata, covariate_keys=["cov_1", "cov_2"])
 
 # start searching with given parameter range
 params = co.bayesian_search(
