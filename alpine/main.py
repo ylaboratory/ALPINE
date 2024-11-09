@@ -19,7 +19,7 @@ class ALPINE:
         n_covariate_components: Union[List[int], int] ,
         n_components: int = 30,
         alpha_W = 0,
-        orth_W = 0,
+        orth_W = 0, 
         l1_ratio = 0,
         lam: Optional[Union[List[float], List[int], float, int]] = None,
         gpu: bool = True,
@@ -154,6 +154,22 @@ class ALPINE:
         sc.pp.normalize_total(exp, target_sum=library_size)
         adata.obsm["normalized_expression"] = exp.X
     
+    def compute_sig_assoc(self, covariate_key: str, sample_labels: pd.Series):
+        
+        if covariate_key not in self.condition_names:
+            raise ValueError("The covariate key does not exist in the model.")
+        idx = self.condition_names.index(covariate_key)
+
+        y_df = pd.get_dummies(sample_labels, dtype=float)
+        y = y_df.values
+
+        H = self.Hs[idx]
+        if H.shape[1] != y.shape[0]:
+            raise ValueError("The number of samples in the input data does not match the number of samples in the model.")
+        
+        sig_assoc = (H @ y) / y.sum(axis=0)
+        sig_assoc_df = pd.DataFrame(sig_assoc, columns=y_df.columns)
+        return sig_assoc_df
 
     def store_embeddings(self, adata: ad.AnnData, embedding_name: Optional[Union[List[str], str]] = None):
         if embedding_name is not None:
