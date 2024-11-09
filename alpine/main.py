@@ -19,6 +19,8 @@ class ALPINE:
         n_covariate_components: Union[List[int], int] ,
         n_components: int = 30,
         alpha_W = 0,
+        orth_W = 0, 
+        l1_ratio = 0,
         lam: Optional[Union[List[float], List[int], float, int]] = None,
         gpu: bool = True,
         scale_needed: bool = True,
@@ -31,6 +33,8 @@ class ALPINE:
         self.n_components = n_components
         self.n_covariate_components = [n_covariate_components] if isinstance(n_covariate_components, int) else n_covariate_components
         self.alpha_W = alpha_W
+        self.orth_W= orth_W
+        self.l1_ratio = l1_ratio
         self.random_state = random_state
         self.gpu = gpu
         self.device = torch.device("cuda" if self.gpu and torch.cuda.is_available() else "cpu")
@@ -77,14 +81,17 @@ class ALPINE:
         Ws, Hs, Bs = self._fit(sample_weights, verbose)
 
         if self.scale_needed:
-            with np.errstate(divide='ignore', invalid='ignore'):
-                Bs = [_b / np.sum(_b, axis=0) for _b in Bs]
-                Bs = [np.where(np.isnan(_b), 0, _b) for _b in Bs]
+            # with np.errstate(divide='ignore', invalid='ignore'):
+            #     Bs = [_b / np.sum(_b, axis=0) for _b in Bs]
+            #     Bs = [np.where(np.isnan(_b), 0, _b) for _b in Bs]
 
             for i in range(len(Ws)):
                 w_scaler = Ws[i].sum(axis=0)
                 Ws[i] /= w_scaler
                 Hs[i] *= w_scaler[:, np.newaxis]
+
+                if i < len(self.n_covariate_components):
+                    Bs[i] /= w_scaler
 
         # Save the matrices
         self.Ws, self.Hs, self.Bs = Ws, Hs, Bs
@@ -132,7 +139,8 @@ class ALPINE:
     def get_conditional_gene_scores (self):
         conditional_gene_scores = []
         for i in range(len(self.Bs)):
-            conditional_gene_scores.append(pd.DataFrame(self.Ws[i] @ self.Hs[i] @ self.y[i].T, columns=self.y_labels[i]))
+            gene_scores = (self.Ws[i] @ self.Hs[i] @ self.y[i].T) / self.y[i].sum(axis=1)
+            conditional_gene_scores.append(pd.DataFrame(gene_scores, columns=self.y_labels[i]))
         return conditional_gene_scores
 
 
@@ -146,6 +154,22 @@ class ALPINE:
         sc.pp.normalize_total(exp, target_sum=library_size)
         adata.obsm["normalized_expression"] = exp.X
     
+    def compute_sig_assoc(self, covariate_key: str, sample_labels: pd.Series):
+        
+        if covariate_key not in self.condition_names:
+            raise ValueError("The covariate key does not exist in the model.")
+        idx = self.condition_names.index(covariate_key)
+
+        y_df = pd.get_dummies(sample_labels, dtype=float)
+        y = y_df.values
+
+        H = self.Hs[idx]
+        if H.shape[1] != y.shape[0]:
+            raise ValueError("The number of samples in the input data does not match the number of samples in the model.")
+        
+        sig_assoc = (H @ y) / y.sum(axis=0)
+        sig_assoc_df = pd.DataFrame(sig_assoc, columns=y_df.columns)
+        return sig_assoc_df
 
     def store_embeddings(self, adata: ad.AnnData, embedding_name: Optional[Union[List[str], str]] = None):
         if embedding_name is not None:
@@ -311,7 +335,7 @@ class ALPINE:
         for i in range(len(self.n_all_components)):
             end_idx = start_idx + Ws[i].shape[1]
             k = Ws[i].shape[1]
-            weights = self.alpha_W * (self.total_components / k)
+            weights = self.orth_W * (self.total_components / k)
             orthogonal_matrix[start_idx:end_idx, start_idx:end_idx] = weights * torch.ones(k, k, device=self.device) - torch.eye(k, device=self.device)
             start_idx = end_idx
 
@@ -339,11 +363,16 @@ class ALPINE:
                     W_numerator = X_sub @ H_sub.T
                     # W_denominator = W @ H_sub @ H_sub.T
 
-                    # l1 norm
-                    # W_denominator += self.alpha_W * torch.ones_like(W_denominator)
+                    # orthogonal constraint + l2 norm
+                    W_denominator = W @ (H_sub @ H_sub.T +  (1 - self.l1_ratio) * self.alpha_W * torch.eye(self.total_components, device=self.device) + orthogonal_matrix)
 
                     # orthogonal constraint
-                    W_denominator = W @ (H_sub @ H_sub.T + orthogonal_matrix)
+                    # W_denominator = W @ (H_sub @ H_sub.T + orthogonal_matrix)
+
+                    # l1 norm
+                    W_denominator += self.l1_ratio * self.alpha_W * torch.ones_like(W_denominator)
+
+                    # orthogonal on the entire W
                     # W_denominator = W @ (H_sub @ H_sub.T + self.alpha_W * (torch.ones_like(H_sub @ H_sub.T) - torch.eye(H_sub.shape[0], device=self.device)))
 
 
@@ -446,6 +475,7 @@ class ALPINE:
         y = self.condition_names
         X_new, y_new_input, _ = self._process_input(X, y)
         y_new, M_y = zip(*[self._to_dummies_from_train(i, yi) for i, yi in enumerate(y_new_input)])
+        M_y = [torch.tensor(m, dtype=torch.float32, device=self.device) for m in M_y]
 
         X_new = torch.tensor(X_new, dtype=torch.float32, device=self.device)
         y_new = [torch.tensor(yi, dtype=torch.float32, device=self.device) for yi in y_new]

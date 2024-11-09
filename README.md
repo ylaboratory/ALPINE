@@ -1,5 +1,6 @@
-# ALPINE (Adaptive Layering of Phenotypic and Integrative Noise Extraction)
+# ALPINE
 
+**ALPINE: Adaptive Layering of Phenotypic and Integrative Noise Extraction**
 
 `ALPINE` is a semi-supervised non-negative matrix factorization (NMF) framework designed to effectively distinguish between multiple phenotypic conditions based on shared biological factors, while also providing direct interpretability of condition-associated genes. The entire package is developed in Python and supports GPU usage, significantly enhancing computational speed.
 
@@ -39,7 +40,7 @@ ALPINE integrates a Bayesian optimizer to efficiently search for all necessary h
 from alpine import ComponentOptimizer
 
 # create optimization object with data and covariate keys
-co = co.ComponentOptimizer(adata, covariate_keys=["cov_1", "cov_2"])
+co = ComponentOptimizer(adata, covariate_keys=["cov_1", "cov_2"])
 
 # start searching with given parameter range
 params = co.bayesian_search(
