@@ -45,15 +45,19 @@ co = ComponentOptimizer(adata, covariate_keys=["cov_1", "cov_2"])
 # start searching with given parameter range
 params = co.bayesian_search(
     n_total_components_range=(50, 100), 
-    lam_power_range=(1, 5), 
-    alpha_W_range=(0, 0.5)
+    alpha_W_range=(0, 1),
+    orth_W_range=(0, 0.5),
+    l1_ratio_range=(0, 1),
 )
 ```
 
 - `covariate_keys` specifies the categorical columns in `adata.obs` that will be used as covariates.
 - `n_total_components_range` sets the range for the total number of components, including `n_components` for unguided embeddings and `n_covariate_components` for guided embeddings.
 - `lam_power_range` defines the range for lambda values, spanning from \(10^1\) to \(10^5\).
-- `alpha_W_range` is the range for the orthogonal weights of the \(W\) matrix, designed to encourage gene signatures to capture distinct patterns.
+- `orth_W_range`: The range for the orthogonal weight regularization on the \( W \) matrix, designed to encourage gene signatures to capture distinct patterns.
+- `l1_ratio_range`: The range for the L1 ratio, controlling the balance between L1 (LASSO) and L2 (ridge) regularization.
+- `alpha_W_range`: The range for the regularization weight on the \( W \) matrix, determining the influence of LASSO and ridge regularization on \( W \).
+
 
 The `ComponentOptimizer` class offers a range of convenient and practical functions to help users monitor and extend their training process. See the analysis section below for more details.
 
