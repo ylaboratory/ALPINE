@@ -334,7 +334,7 @@ class ALPINE:
 
     def _get_best_max_iter (self, loss_history):
         kneedle = KneeLocator(np.arange(0, loss_history.shape[0]), 
-                              np.log10(loss_history["reconstruction_loss"].values), 
+                              loss_history["total_loss"].values, 
                               curve='convex', direction='decreasing')
         return kneedle.elbow
     
@@ -431,15 +431,15 @@ class ALPINE:
                         
                         # logistic regression
                         BH = B_b @ H_b
-                        Y_pred = F.softmax(BH, dim=0)
-                        B_numerator = y_b @ H_b.T
-                        B_denominator = Y_pred @ H.T
+                        Y_pred = M * (F.softmax(BH, dim=0))
+                        B_numerator = (M * y_b) @ H_b.T
+                        B_denominator = Y_pred @ H_b.T
 
                         Bs[b] *= torch.div(torch.clamp(B_numerator, min=self.eps), torch.clamp(B_denominator, min=self.eps))
 
                     # update partial H
-                    H_label_numerator = torch.zeros_like(H_sub) + self.eps
-                    H_label_denominator = torch.zeros_like(H_sub) + self.eps
+                    H_label_numerator = torch.zeros_like(H_sub)
+                    H_label_denominator = torch.zeros_like(H_sub)
 
                     start_idx = 0
                     for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
@@ -453,8 +453,8 @@ class ALPINE:
 
                         # logistic regression
                         BH = B_b @ H_b
-                        Y_pred = F.softmax(BH, dim=0)
-                        H_numerator = self.lam[b] * B_b.T @ y_b
+                        Y_pred = M * F.softmax(BH, dim=0)
+                        H_numerator = self.lam[b] * B_b.T @ (M * y_b)
                         H_denominator = self.lam[b] * B_b.T @ Y_pred
 
                         H_label_numerator[start_idx:end_idx] += H_numerator
@@ -483,10 +483,19 @@ class ALPINE:
                 H = torch.cat(Hs, dim=0)
                 recon_loss = torch.norm(X - W @ H, 'fro')**2
 
-                if self.loss_type == "kl-divergence":
-                    label_loss = [self._kl_divergence(_y, _b @ _h) for _y, _b, _h in zip(y, Bs, Hs)]
-                else:
-                    label_loss = [torch.norm(_y - _b @ _h, 'fro')**2 for _y, _b, _h in zip(y, Bs, Hs)]
+                # if self.loss_type == "kl-divergence":
+                #     label_loss = [self._kl_divergence(_y, _b @ _h) for _y, _b, _h in zip(y, Bs, Hs)]
+                # else:
+                #     label_loss = [torch.norm(_y - _b @ _h, 'fro')**2 for _y, _b, _h in zip(y, Bs, Hs)]
+
+                # logistic regression
+                label_loss = []
+                for _y, _b, _h in zip(y, Bs, Hs):
+                    logits = _b @ _h  # Compute logits
+                    probs = F.softmax(logits, dim=0)  # Apply softmax to logits
+                    probs = torch.clamp(probs, min=self.eps)  # Clamp probabilities to avoid log(0)
+                    loss = -torch.sum(_y * torch.log(probs))  # Compute cross-entropy
+                    label_loss.append(loss)
 
                 weighted_label_loss = [self.lam[i] * ll for i, ll in enumerate(label_loss)]
                 label_total_loss = torch.sum(torch.stack(weighted_label_loss))
