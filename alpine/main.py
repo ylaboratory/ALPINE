@@ -3,7 +3,10 @@ import pandas as pd
 import anndata as ad
 import scanpy as sc
 import torch
+import torch.nn.functional as F
 
+from scipy.special import softmax
+from scipy.stats import chi2
 from kneed import KneeLocator
 from tqdm import tqdm
 from typing import Optional, Union, List, Tuple
@@ -191,7 +194,40 @@ class ALPINE:
         adata.obsm["ALPINE_embedding"] = self.Hs[-1].T
         adata.varm["ALPINE_embedding"] = self.Ws[-1]
 
-    
+
+    def get_p_values(self):
+
+        def log_likelihood(Y, B, H):
+            logits = np.dot(B, H)  # Compute logits (labels-by-samples)
+            probs = softmax(logits, axis=0)  # Column-wise softmax
+            log_probs = np.log(probs + 1e-10)  # Avoid log(0) issues
+            return np.sum(Y * log_probs)  # Element-wise product with Y and summation
+        
+        def elementwise_lrt(Y, H, B):
+            num_labels, num_signatures = B.shape
+            p_values = np.zeros_like(B)
+
+            for i in range(num_labels):
+                for j in range(num_signatures):
+                    # Null model: B_ij = 0
+                    B_null = B.copy()
+                    B_null[i, j] = 0
+
+                    # Log-likelihoods
+                    ll_null = log_likelihood(Y, B_null, H)
+                    ll_alt = log_likelihood(Y, B, H)
+
+                    # Test statistic
+                    test_stat = -2 * (ll_null - ll_alt)
+
+                    # Degrees of freedom = 1
+                    p_value = 1 - chi2.cdf(test_stat, df=1)
+                    p_values[i, j] = p_value
+
+            return p_values
+        return [elementwise_lrt(self.y[i], self.Hs[i], self.Bs[i]) for i in range(len(self.y))]
+
+
     def _check_params(self):
         if not isinstance(self.n_components, int) or self.n_components <= 0:
             raise ValueError("n_components must be a positive integer")
@@ -386,12 +422,18 @@ class ALPINE:
                         start_idx = end_idx
 
                     for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
-                        if self.loss_type == "kl-divergence":
-                            B_numerator = torch.div((M * y_b), torch.clamp(M * (B_b @ H_b), min=self.eps)) @ H_b.T
-                            B_denominator = torch.ones_like(y_b) @ H_b.T
-                        else:
-                            B_numerator = (M * y_b) @ H_b.T
-                            B_denominator = (M * (B_b @ H_b)) @ H_b.T
+                        # if self.loss_type == "kl-divergence":
+                        #     B_numerator = torch.div((M * y_b), torch.clamp(M * (B_b @ H_b), min=self.eps)) @ H_b.T
+                        #     B_denominator = torch.ones_like(y_b) @ H_b.T
+                        # else:
+                        #     B_numerator = (M * y_b) @ H_b.T
+                        #     B_denominator = (M * (B_b @ H_b)) @ H_b.T
+                        
+                        # logistic regression
+                        BH = B_b @ H_b
+                        Y_pred = F.softmax(BH, dim=0)
+                        B_numerator = y_b @ H_b.T
+                        B_denominator = Y_pred @ H.T
 
                         Bs[b] *= torch.div(torch.clamp(B_numerator, min=self.eps), torch.clamp(B_denominator, min=self.eps))
 
@@ -402,12 +444,18 @@ class ALPINE:
                     start_idx = 0
                     for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
                         end_idx = start_idx + H_b.shape[0]
-                        if self.loss_type == "kl-divergence":
-                            H_numerator = self.lam[b] * B_b.T @ torch.div((M * y_b), torch.clamp(M *(B_b @ H_b), min=self.eps))
-                            H_denominator = self.lam[b] * B_b.T @ torch.ones_like(y_b)
-                        else:
-                            H_numerator = 2 * self.lam[b] * B_b.T @ (M * y_b)
-                            H_denominator = 2 * self.lam[b] * B_b.T @ (M * (B_b @ H_b))
+                        # if self.loss_type == "kl-divergence":
+                        #     H_numerator = self.lam[b] * B_b.T @ torch.div((M * y_b), torch.clamp(M *(B_b @ H_b), min=self.eps))
+                        #     H_denominator = self.lam[b] * B_b.T @ torch.ones_like(y_b)
+                        # else:
+                        #     H_numerator = 2 * self.lam[b] * B_b.T @ (M * y_b)
+                        #     H_denominator = 2 * self.lam[b] * B_b.T @ (M * (B_b @ H_b))
+
+                        # logistic regression
+                        BH = B_b @ H_b
+                        Y_pred = F.softmax(BH, dim=0)
+                        H_numerator = self.lam[b] * B_b.T @ y_b
+                        H_denominator = self.lam[b] * B_b.T @ Y_pred
 
                         H_label_numerator[start_idx:end_idx] += H_numerator
                         H_label_denominator[start_idx:end_idx] += H_denominator
