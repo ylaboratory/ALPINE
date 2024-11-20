@@ -24,6 +24,7 @@ kneed = "^0.8.5"
 # name = "pytorch"
 # url = "https://download.pytorch.org/whl/cu124"
 # priority = "explicit"
+torch = "^2.5.1"
 
 [build-system]
 requires = ["poetry-core"]
