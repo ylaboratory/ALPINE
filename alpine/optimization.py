@@ -33,6 +33,9 @@ class ComponentOptimizer:
         self.best_param = {}
         self.minimum_set_param = {}
 
+        if self.max_iter is None:
+            self.max_iter_detect = True
+
     
 
     def calc_ari(self, args):
@@ -119,11 +122,12 @@ class ComponentOptimizer:
             'score': score
         }
         
-        if len(self.iter_records) < 10:
-            self.iter_records.append(self.max_iter)
-            self.max_iter = None
-        else:
-            self.max_iter = max(self.iter_records)
+        if self.max_iter_detect:
+            if len(self.iter_records) < 5:
+                self.iter_records.append(self.max_iter)
+                self.max_iter = None
+            else:
+                self.max_iter = max(self.iter_records)
 
         loss = score + self.weight_reduce_covar_dims * (sum(n_covariate_components)/(sum(n_covariate_components) + n_components))
         return {'loss': loss, 'status': STATUS_OK, 'params': trial_history}
