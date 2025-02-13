@@ -80,7 +80,7 @@ class ComponentOptimizer:
                 
                 model.fit(X=train_adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, batch_size=self.batch_size, verbose=False)
                 model.store_embeddings(train_adata)
-                _ = model.transform(val_adata)
+                _ = model.transform(val_adata, use_label=True)
 
                 sc.pp.neighbors(val_adata, use_rep='ALPINE_embedding')
                 sc.tl.leiden(val_adata, flavor="igraph")
@@ -131,19 +131,22 @@ class ComponentOptimizer:
 
 
 
-    def n_component_assignment (self, x, min_components):
+    def n_component_assignment(self, x, min_components):
         n_all_components = int(x["n_all_components"])
 
         n_component_ratio = [x[f'components_ratio_{i}'] for i in range(len(self.covariate_keys) + 1)]
         n_component_ratio = [ratio / sum(n_component_ratio) for ratio in n_component_ratio]
 
-        n_components = int(x['n_all_components'] / 2)
+        n_components = int(n_all_components / 2)
         rest_components = n_all_components - n_components
-        n_component_int = [int(ratio * rest_components) for ratio in n_component_ratio]
+        n_covariate_components = [int(ratio * rest_components) for ratio in n_component_ratio[1:]]
 
-        n_components += n_component_int[0]
-        n_covariate_components = n_component_int[1:]
+        # Ensure that each covariate component is at least the minimum required
         n_covariate_components = [max(min_components[i], n) for i, n in enumerate(n_covariate_components)]
+
+        # Adjust n_components to ensure the total sum is equal to n_all_components
+        total_covariate_components = sum(n_covariate_components)
+        n_components = n_all_components - total_covariate_components
 
         return n_components, n_covariate_components
 
@@ -171,7 +174,7 @@ class ComponentOptimizer:
             'alpha_W': space['alpha_W'],
             'orth_W': space['orth_W'],
             'l1_ratio': space['l1_ratio'],
-            'max_iter': self.iter_records[-1],
+            'max_iter': self.iter_records[-1] if self.max_iter_detect else self.max_iter,
             'score': score
         }
         
@@ -187,11 +190,11 @@ class ComponentOptimizer:
     def bayesian_search(
             self,
             n_total_components_range=(50, 100),
-            lam_power_range=(2, 6),
+            lam_power_range=(1, 6),
             alpha_W_range=(0, 1),
             orth_W_range=(0, 0.5),
             l1_ratio_range=(0, 1),
-            weight_reduce_covar_dims=0,
+            weight_reduce_covar_dims=0.5,
             n_splits=None,
             max_evals=50,
             min_components=None,
@@ -355,6 +358,13 @@ class ComponentOptimizer:
 
         # Concatenate the expanded columns back to the original DataFrame
         history_df = pd.concat([history_df.drop(columns=['n_covariate_components', 'lam']), n_covariate_df, lam_df], axis=1)
+
+        # Add n_total_components as the sum of n_components and all n_covariate_components
+        history_df['n_total_components'] = history_df['n_components'] + history_df[[f'n_covariate_components_{i}' for i in range(len(n_covariate_df.columns))]].sum(axis=1)
+
+        # Reorder columns to have n_components related columns at the beginning
+        columns_order = ['n_components'] + [f'n_covariate_components_{i}' for i in range(len(n_covariate_df.columns))] + ['n_total_components'] + [col for col in history_df.columns if col not in ['n_components', 'n_total_components'] + [f'n_covariate_components_{i}' for i in range(len(n_covariate_df.columns))]]
+        history_df = history_df[columns_order]
 
         # Sort by score in descending order and reset the index
         history_df = history_df.sort_values(by='score', ascending=False).reset_index(drop=True)
