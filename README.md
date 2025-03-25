@@ -91,7 +91,7 @@ alpine_model.fit(adata, covariate_keys=["cov_1", "cov_2"])
 Finally, users can save the trained embeddings directly into `adata` by running:
 
 ```python
-alpine_model.store_embedding(adata)
+alpine_model.store_embeddings(adata)
 
 # the H embedding can be retrieved by
 alpine_model.obsm["ALPINE_embedding"] # unguided embedding

@@ -80,7 +80,7 @@ class ComponentOptimizer:
                 
                 model.fit(X=train_adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, batch_size=self.batch_size, verbose=False)
                 model.store_embeddings(train_adata)
-                _ = model.transform(val_adata, use_label=True)
+                _ = model.transform(val_adata, use_label=False)
 
                 sc.pp.neighbors(val_adata, use_rep='ALPINE_embedding')
                 sc.tl.leiden(val_adata, flavor="igraph")
