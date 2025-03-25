@@ -22,7 +22,7 @@ pip install -e .
 ```
 
 **Important:**
-ALPINE is implemented in [PyTorch](https://pytorch.org/), so users will need to install PyTorch separately to ensure compatibility with their specific CUDA or CPU version.
+ALPINE is implemented in [PyTorch](https://pytorch.org/), the `pyproject.toml` has included the installation of it. However, if user has issued with the `Pytorch` version. Users will need to install PyTorch separately to ensure compatibility with their specific CUDA or CPU version.
 
 ## Usage
 
