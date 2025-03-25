@@ -17,6 +17,14 @@ The ALPINE preprint is now available; please review the article at [link](https:
 Currently, `ALPINE` is not yet available on the PyPI repository. However, users can clone the entire repository and install the package in their environment by running:
 
 ```shell
+# download the repo
+git clone https://github.com/ylaboratory/ALPINE.git
+cd ALPINE
+
+# you can install it in your python environment via your favorite package manager
+conda activate your_env_name
+# mamba activate your_env_name
+
 # in the alpine folder
 pip install -e .
 ```
