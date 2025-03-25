@@ -20,8 +20,7 @@ class ComponentOptimizer:
             max_iter=None,
             batch_size=None,
             gpu=True,
-            random_state=None,
-            lam=None,
+            random_state=None
         ):
         self.adata = adata.copy()
         self.covariate_keys = covariate_keys
@@ -30,7 +29,6 @@ class ComponentOptimizer:
         self.random_state = random_state
         self.gpu = gpu
         self.batch_size = batch_size
-        self.lam = lam
         self.best_param = {}
         self.minimum_set_param = {}
 
