@@ -8,6 +8,7 @@ from kneed import KneeLocator
 from sklearn.metrics.cluster import adjusted_rand_score, homogeneity_score
 from hyperopt import fmin, tpe, hp, Trials, STATUS_OK, STATUS_FAIL
 from .main import ALPINE
+from sklearn.model_selection import StratifiedKFold
 
 class ComponentOptimizer:
 
@@ -19,8 +20,7 @@ class ComponentOptimizer:
             max_iter=None,
             batch_size=None,
             gpu=True,
-            random_state=None,
-            lam=None,
+            random_state=None
         ):
         self.adata = adata.copy()
         self.covariate_keys = covariate_keys
@@ -29,9 +29,13 @@ class ComponentOptimizer:
         self.random_state = random_state
         self.gpu = gpu
         self.batch_size = batch_size
-        self.lam = lam
         self.best_param = {}
         self.minimum_set_param = {}
+
+        if self.max_iter is None:
+            self.max_iter_detect = True
+        else:
+            self.max_iter_detect = False
 
     
 
@@ -43,51 +47,104 @@ class ComponentOptimizer:
         orth_W = args['orth_W']
         l1_ratio = args['l1_ratio']
 
-        model = ALPINE(
-            n_covariate_components=n_covariate_components,
-            n_components=n_components,
-            lam=lam,
-            alpha_W=alpha_W,
-            orth_W=orth_W,
-            l1_ratio=l1_ratio,
-            random_state=self.random_state,
-            loss_type=self.loss_type,
-            gpu=self.gpu,
-        )
+        # Create joint labels for stratification
+        if len(self.covariate_keys) == 1:
+            joint_labels = self.adata.obs[self.covariate_keys[0]].astype(str)
+        else:
+            joint_labels = self.adata.obs[self.covariate_keys[0]].astype(str)
+            for key in self.covariate_keys[1:]:
+                joint_labels = joint_labels + '_' + self.adata.obs[key].astype(str)
 
-        # Fit the model on the training data
-        adata = self.adata.copy()
-        model.fit(X=adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, batch_size=self.batch_size, verbose=False)
-        model.store_embeddings(adata)
-        self.max_iter = model.max_iter
-
-        sc.pp.neighbors(adata, use_rep='ALPINE_embedding')
-        sc.tl.leiden(adata, flavor="igraph")
-
-        # Calculate the score
-        score = 0
-        for key in self.covariate_keys:
-            selected_idx = ~adata.obs[key].isna()
-            score += adjusted_rand_score(adata.obs[key][selected_idx], adata.obs["leiden"][selected_idx])
-            score += homogeneity_score(adata.obs[key][selected_idx], adata.obs["leiden"][selected_idx])
-        score /= len(self.covariate_keys)
+        scores = []
         
+        if self.n_splits is not None:
+            skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
+            
+            for train_idx, val_idx in skf.split(self.adata.X, joint_labels):
+                train_adata = self.adata[train_idx].copy()
+                val_adata = self.adata[val_idx].copy()
+                
+                model = ALPINE(
+                    n_covariate_components=n_covariate_components,
+                    n_components=n_components,
+                    lam=lam,
+                    alpha_W=alpha_W,
+                    orth_W=orth_W,
+                    l1_ratio=l1_ratio,
+                    random_state=self.random_state,
+                    loss_type=self.loss_type,
+                    gpu=self.gpu,
+                )
+                
+                model.fit(X=train_adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, batch_size=self.batch_size, verbose=False)
+                model.store_embeddings(train_adata)
+                _ = model.transform(val_adata, use_label=False)
+
+                sc.pp.neighbors(val_adata, use_rep='ALPINE_embedding')
+                sc.tl.leiden(val_adata, flavor="igraph")
+
+                fold_score = 0
+                for key in self.covariate_keys:
+                    selected_idx = ~val_adata.obs[key].isna()
+                    fold_score += adjusted_rand_score(val_adata.obs[key][selected_idx], val_adata.obs["leiden"][selected_idx])
+                    fold_score += homogeneity_score(val_adata.obs[key][selected_idx], val_adata.obs["leiden"][selected_idx])
+                scores.append(fold_score / len(self.covariate_keys))
+                
+                if self.max_iter_detect:
+                    self.iter_records.append(model.max_iter)
+
+            score = np.mean(scores)
+        
+        else:
+            model = ALPINE(
+                n_covariate_components=n_covariate_components,
+                n_components=n_components,
+                lam=lam,
+                alpha_W=alpha_W,
+                orth_W=orth_W,
+                l1_ratio=l1_ratio,
+                random_state=self.random_state,
+                loss_type=self.loss_type,
+                gpu=self.gpu,
+            )
+
+            adata = self.adata.copy()
+            model.fit(X=adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, batch_size=self.batch_size, verbose=False)
+            model.store_embeddings(adata)
+
+            sc.pp.neighbors(adata, use_rep='ALPINE_embedding')
+            sc.tl.leiden(adata, flavor="igraph")
+
+            score = 0
+            for key in self.covariate_keys:
+                selected_idx = ~adata.obs[key].isna()
+                score += adjusted_rand_score(adata.obs[key][selected_idx], adata.obs["leiden"][selected_idx])
+                score += homogeneity_score(adata.obs[key][selected_idx], adata.obs["leiden"][selected_idx])
+            score /= len(self.covariate_keys)
+
+            if self.max_iter_detect:
+                self.iter_records.append(model.max_iter)
+
         return score
 
 
-    def n_component_assignment (self, x, min_components):
+
+    def n_component_assignment(self, x, min_components):
         n_all_components = int(x["n_all_components"])
 
         n_component_ratio = [x[f'components_ratio_{i}'] for i in range(len(self.covariate_keys) + 1)]
         n_component_ratio = [ratio / sum(n_component_ratio) for ratio in n_component_ratio]
 
-        n_components = int(x['n_all_components'] / 2)
+        n_components = int(n_all_components / 2)
         rest_components = n_all_components - n_components
-        n_component_int = [int(ratio * rest_components) for ratio in n_component_ratio]
+        n_covariate_components = [int(ratio * rest_components) for ratio in n_component_ratio[1:]]
 
-        n_components += n_component_int[0]
-        n_covariate_components = n_component_int[1:]
+        # Ensure that each covariate component is at least the minimum required
         n_covariate_components = [max(min_components[i], n) for i, n in enumerate(n_covariate_components)]
+
+        # Adjust n_components to ensure the total sum is equal to n_all_components
+        total_covariate_components = sum(n_covariate_components)
+        n_components = n_all_components - total_covariate_components
 
         return n_components, n_covariate_components
 
@@ -115,28 +172,28 @@ class ComponentOptimizer:
             'alpha_W': space['alpha_W'],
             'orth_W': space['orth_W'],
             'l1_ratio': space['l1_ratio'],
-            'max_iter': self.max_iter,
+            'max_iter': self.iter_records[-1] if self.max_iter_detect else self.max_iter,
             'score': score
         }
         
-        if len(self.iter_records) < 10:
-            self.iter_records.append(self.max_iter)
-            self.max_iter = None
-        else:
-            self.max_iter = max(self.iter_records)
+        if self.max_iter_detect:
+            if len(self.iter_records) >= 5:
+                self.max_iter = max(self.iter_records)
 
-        loss = score + self.weight_reduce_covar_dims * (sum(n_covariate_components)/(sum(n_covariate_components) + n_components))
+        n_totoal_covariate_components = sum(n_covariate_components)
+        loss = score + self.weight_reduce_covar_dims * (n_totoal_covariate_components/(n_totoal_covariate_components + n_components))
         return {'loss': loss, 'status': STATUS_OK, 'params': trial_history}
     
 
     def bayesian_search(
             self,
             n_total_components_range=(50, 100),
-            lam_power_range=(2, 6),
+            lam_power_range=(1, 6),
             alpha_W_range=(0, 1),
             orth_W_range=(0, 0.5),
             l1_ratio_range=(0, 1),
-            weight_reduce_covar_dims = 0,
+            weight_reduce_covar_dims=0.5,
+            n_splits=None,
             max_evals=50,
             min_components=None,
             trials_filename=None
@@ -156,6 +213,7 @@ class ComponentOptimizer:
         self.min_components = min_components
         self.weight_reduce_covar_dims = weight_reduce_covar_dims
         self.iter_records = []
+        self.n_splits = n_splits
 
         # Load previous trials if specified
         if trials_filename is not None:
@@ -298,6 +356,13 @@ class ComponentOptimizer:
 
         # Concatenate the expanded columns back to the original DataFrame
         history_df = pd.concat([history_df.drop(columns=['n_covariate_components', 'lam']), n_covariate_df, lam_df], axis=1)
+
+        # Add n_total_components as the sum of n_components and all n_covariate_components
+        history_df['n_total_components'] = history_df['n_components'] + history_df[[f'n_covariate_components_{i}' for i in range(len(n_covariate_df.columns))]].sum(axis=1)
+
+        # Reorder columns to have n_components related columns at the beginning
+        columns_order = ['n_components'] + [f'n_covariate_components_{i}' for i in range(len(n_covariate_df.columns))] + ['n_total_components'] + [col for col in history_df.columns if col not in ['n_components', 'n_total_components'] + [f'n_covariate_components_{i}' for i in range(len(n_covariate_df.columns))]]
+        history_df = history_df[columns_order]
 
         # Sort by score in descending order and reset the index
         history_df = history_df.sort_values(by='score', ascending=False).reset_index(drop=True)

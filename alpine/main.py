@@ -74,9 +74,10 @@ class ALPINE:
             self.max_iter = 200
             _, _, _ = self._fit(sample_weights, verbose=False)
             self.max_iter = self._get_best_max_iter(self.loss_history)
-
-            if self.max_iter == 0:
-                raise ValueError("The model cannot detect the optimal max_iter. Please provide the max_iter manually.")
+            
+            if self.max_iter == 0 or self.max_iter is None:
+                print("The max_iter detection is unable to find a good max_iter. The max_iter set to 200 as default.")
+                self.max_iter = 200
         
         Ws, Hs, Bs = self._fit(sample_weights, verbose)
 
@@ -103,16 +104,18 @@ class ALPINE:
             self,
             X: ad.AnnData,
             n_iter: Optional[int] = None,
-            lam = None
+            lam = None,
+            use_label = True,
         ) -> List[np.ndarray]:
 
-        n_iter = n_iter
+        if n_iter is None:
+            n_iter = 1000
 
         # if n_iter is None, will find a optimized n_iter
-        if n_iter is None:
-            _, loss_history = self._transform(X, lam=lam, n_iter=200)
-            n_iter = self._get_best_max_iter(loss_history)
-        Hs, _ = self._transform(X, n_iter=n_iter, lam=lam)
+        if use_label:
+            Hs, _ = self._transform(X, n_iter=n_iter, lam=lam)
+        else:
+            Hs, _ = self._transform_wo_labels(X, n_iter=n_iter)
         return Hs
 
 
@@ -225,6 +228,12 @@ class ALPINE:
 
 
     def _check_decomposed_matrices(self):
+
+        if self.random_state is not None:
+            torch.manual_seed(self.random_state)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.random_state)
+                
         n_feature, n_sample = self.X.shape
 
         if self.Ws is not None:
@@ -304,11 +313,6 @@ class ALPINE:
     
 
     def _fit(self, sample_weights, verbose):
-
-        if self.random_state is not None:
-            torch.manual_seed(self.random_state)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(self.random_state)
 
         X = torch.tensor(self.X, dtype=torch.float32, device=self.device)
         n_sample = X.shape[1]
@@ -395,6 +399,7 @@ class ALPINE:
 
                         Bs[b] *= torch.div(torch.clamp(B_numerator, min=self.eps), torch.clamp(B_denominator, min=self.eps))
 
+
                     # update partial H
                     H_label_numerator = torch.zeros_like(H_sub) + self.eps
                     H_label_denominator = torch.zeros_like(H_sub) + self.eps
@@ -466,12 +471,62 @@ class ALPINE:
         return Ws, Hs, Bs
 
 
+    def _transform_wo_labels(
+        self, X: ad.AnnData,
+        n_iter: Optional[int] = None,
+        batch_size = None,
+        lam = None        
+    ):
+        if self.random_state is not None:
+            torch.manual_seed(self.random_state)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.random_state)
+
+        y = self.condition_names
+        X_new, _, _ = self._process_input(X, y)
+        X_new = torch.tensor(X_new, dtype=torch.float32, device=self.device)
+
+        Ws = [torch.tensor(w, dtype=torch.float32, device=self.device) for w in self.Ws]
+        W = torch.cat(Ws, dim=1)
+
+        n_sample = X_new.shape[1]
+        Hs_new = [torch.rand((k, n_sample), dtype=torch.float32, device=self.device) for k in self.n_all_components]
+        H = torch.cat(Hs_new, dim=0)
+
+        for i in range(n_iter):
+            numerator = torch.clamp(2 * W.T @ X_new, min=self.eps)
+            denominator = torch.clamp(2 * W.T @ W @ H, min=self.eps)
+            H *= torch.div(numerator, denominator)
+            H = torch.clamp(H, min=self.eps)
+        
+        start_idx = 0
+        for idx, h in enumerate(Hs_new):
+            end_idx = start_idx + h.shape[0]
+            Hs_new[idx] = H[start_idx:end_idx]
+            start_idx = end_idx
+
+        Hs_new = [h.cpu().numpy() for h in Hs_new]
+        for i, y_name in enumerate(y):
+            X.obsm[y_name] = Hs_new[i].T
+            X.varm[y_name] = deepcopy(self.Ws[i])
+        X.obsm["ALPINE_embedding"] = deepcopy(Hs_new[-1].T)
+        X.varm["ALPINE_embedding"] = deepcopy(self.Ws[-1])
+
+        return Hs_new, _
+
+
     def _transform(
             self, X: ad.AnnData, 
             n_iter: Optional[int] = None,
             batch_size = None,
             lam = None
         ):
+
+        if self.random_state is not None:
+            torch.manual_seed(self.random_state)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.random_state)
+
         y = self.condition_names
         X_new, y_new_input, _ = self._process_input(X, y)
         y_new, M_y = zip(*[self._to_dummies_from_train(i, yi) for i, yi in enumerate(y_new_input)])

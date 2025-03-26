@@ -10,17 +10,27 @@ ALPINE can be useful for:
 - Studying the biological functions of condition-related genes.
 - Removing batch effects from the data.
 
+The ALPINE preprint is now available; please review the article at [link](https://www.biorxiv.org/content/10.1101/2025.02.15.638471v1).
+
 ## Installation
 
 Currently, `ALPINE` is not yet available on the PyPI repository. However, users can clone the entire repository and install the package in their environment by running:
 
 ```shell
+# download the repo
+git clone https://github.com/ylaboratory/ALPINE.git
+cd ALPINE
+
+# you can install it in your python environment via your favorite package manager
+conda activate your_env_name
+# mamba activate your_env_name
+
 # in the alpine folder
 pip install -e .
 ```
 
 **Important:**
-ALPINE is implemented in [PyTorch](https://pytorch.org/), so users will need to install PyTorch separately to ensure compatibility with their specific CUDA or CPU version.
+ALPINE is implemented in [PyTorch](https://pytorch.org/), the `pyproject.toml` has included the installation of it. However, if user has issued with the `Pytorch` version. Users will need to install PyTorch separately to ensure compatibility with their specific CUDA or CPU version.
 
 ## Usage
 
@@ -66,6 +76,7 @@ The `ComponentOptimizer` class offers a range of convenient and practical functi
 With ALPINE, you have the flexibility to either manually define the parameters you want to use or apply the optimized parameters learned from previous steps.
 
 #### a. Training the model
+
 1. **Manually specified parameters:**
 
 ```python
@@ -80,7 +91,7 @@ alpine_model = ALPINE(
 alpine_model.fit(adata, covariate_keys=["cov_1", "cov_2"])
 ```
 
-2.  **Using optimized parameters from `ComponentOptimizer` (Recommend):**
+2. **Using optimized parameters from `ComponentOptimizer` (Recommend):**
 
 ```python
 # if you use the ComponentOptimizer, you can simply plugin the parameteres learned from the last step
@@ -91,7 +102,7 @@ alpine_model.fit(adata, covariate_keys=["cov_1", "cov_2"])
 Finally, users can save the trained embeddings directly into `adata` by running:
 
 ```python
-alpine_model.store_embedding(adata)
+alpine_model.store_embeddings(adata)
 
 # the H embedding can be retrieved by
 alpine_model.obsm["ALPINE_embedding"] # unguided embedding
@@ -104,6 +115,7 @@ alpine_model.varm["cov_1"] # covariate gene signature embedding
 alpine_model.varm["cov_2"] # covariate gene signature embedding
 
 ```
+
 #### b. Get the decomposed matrices and counts
 
 In addition to obtaining embeddings from `adata`, users can also retrieve the decomposed matrices from the `ALPINE` model by using:
@@ -111,6 +123,7 @@ In addition to obtaining embeddings from `adata`, users can also retrieve the de
 ```python
 Ws, Hs, Bs = alpine_model.get_decomposed_matrices()
 ```
+
 The order of the matrices in `Ws` and `Hs` follows the sequence of the covariate keys, with the unguided embeddings placed at the end. In contrast, the `Bs` matrices do not include the unguided portion; their order strictly adheres to the covariate keys.
 
 To obtain the normalized counts that are free from batch effects and conditions, where:
@@ -133,5 +146,7 @@ All analyses from the papers and case studies are stored in the ALPINE-analysis 
 - Retrieve condition-associated gene scores.
 - Transform new, unseen data using the trained model.
 
-
 ## Citation
+
+If you use our tool in your study, please cite the following paper:
+> Lee WH, Li L, Dannenfelser R, Yao V. Interpretable phenotype decoding from multi-condition sequencing data with ALPINE. bioRxiv. 2025:2025-02.
