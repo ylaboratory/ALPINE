@@ -26,7 +26,7 @@ conda activate your_env_name
 # mamba activate your_env_name
 
 # in the alpine folder
-pip install -e .
+pip install .
 ```
 
 **Important:**
