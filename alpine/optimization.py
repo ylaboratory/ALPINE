@@ -11,7 +11,48 @@ from .main import ALPINE
 from sklearn.model_selection import StratifiedKFold
 
 class ComponentOptimizer:
-
+    """
+    ComponentOptimizer is a class designed for optimizing the parameters of the ALPINE model using Bayesian optimization. 
+    It provides methods for calculating ARI scores, assigning components, performing Bayesian searches, and managing trials.
+    Attributes:
+        adata (AnnData): The annotated data matrix.
+        covariate_keys (list): List of covariate keys used for stratification.
+        loss_type (str): The type of loss function to use. Default is 'kl-divergence'.
+        max_iter (int or None): Maximum number of iterations for model training. If None, it will be detected dynamically.
+        batch_size (int or None): Batch size for training. Default is None.
+        gpu (bool): Whether to use GPU for training. Default is True.
+        random_state (int or None): Random seed for reproducibility. Default is None.
+        best_param (dict): Stores the best parameters found during optimization.
+        minimum_set_param (dict): Stores the minimum set of parameters.
+        min_components (list): Minimum number of components for each covariate.
+        weight_reduce_covar_dims (float): Weight for penalizing the number of covariate components.
+        iter_records (list): Records of iterations during training.
+        n_splits (int or None): Number of splits for cross-validation.
+        trials (Trials): Stores the trials object for Bayesian optimization.
+        space (dict): Search space for Bayesian optimization.
+    Methods:
+        calc_ari(args):
+            Calculates the Adjusted Rand Index (ARI) and homogeneity score for the given parameters.
+        n_component_assignment(x, min_components):
+            Assigns the number of components for the model based on the given ratios and minimum components.
+        objective(space):
+            Objective function for Bayesian optimization. Calculates the loss based on ARI and penalizes covariate dimensions.
+        bayesian_search(n_total_components_range, lam_power_range, alpha_W_range, orth_W_range, l1_ratio_range, 
+                        weight_reduce_covar_dims, n_splits, max_evals, min_components, trials_filename):
+            Performs Bayesian optimization to find the best hyperparameters for the model.
+        extend_training(extra_evals):
+            Extends the Bayesian optimization process with additional evaluations.
+        save_trials(filename):
+            Saves the current trials to a file.
+        load_trials(filename):
+            Loads trials from a file.
+        get_hyperparameter(idx):
+            Retrieves the hyperparameters of a specific trial by index.
+        get_train_history():
+            Retrieves the training history as a pandas DataFrame, including trial details and scores.
+        fit_the_best_param():
+            Fits the ALPINE model using the best parameters found during Bayesian optimization.
+    """
     def __init__(
             self,
             adata,
@@ -198,6 +239,46 @@ class ComponentOptimizer:
             min_components=None,
             trials_filename=None
         ):
+        """
+        Perform Bayesian optimization to search for the best hyperparameters.
+        This method uses Tree-structured Parzen Estimator (TPE) to optimize the 
+        hyperparameters for a model. It defines a search space, evaluates the 
+        objective function, and finds the best parameters.
+        Parameters:
+            n_total_components_range (tuple, optional): 
+                Range for the total number of components. Defaults to (50, 100).
+            lam_power_range (tuple, optional): 
+                Range for the power of lambda regularization. Defaults to (1, 6).
+            alpha_W_range (tuple, optional): 
+                Range for the alpha_W parameter. Defaults to (0, 1).
+            orth_W_range (tuple, optional): 
+                Range for the orthogonality regularization of W. Defaults to (0, 0.5).
+            l1_ratio_range (tuple, optional): 
+                Range for the L1 ratio. Defaults to (0, 1).
+            weight_reduce_covar_dims (float, optional): 
+                Weight to reduce covariance dimensions. Defaults to 0.5.
+            n_splits (int, optional): 
+                Number of splits for cross-validation. Defaults to None.
+            max_evals (int, optional): 
+                Maximum number of evaluations for the optimization. Defaults to 50.
+            min_components (int or list, optional): 
+                Minimum number of components for each covariate. If None, it is 
+                inferred from the data. Defaults to None.
+            trials_filename (str, optional): 
+                Path to a file to load/save optimization trials. Defaults to None.
+        Returns:
+            dict: A dictionary containing the best hyperparameters:
+                - 'n_components': Total number of components.
+                - 'n_covariate_components': Number of components for each covariate.
+                - 'lam': List of lambda values for each covariate.
+                - 'alpha_W': Best alpha_W value.
+                - 'orth_W': Best orth_W value.
+                - 'l1_ratio': Best L1 ratio value.
+                - 'random_state': Random state used for reproducibility.
+        Raises:
+            ValueError: If `min_components` is less than 2 or if its length does 
+                not match the number of covariates.
+        """
 
         if min_components is None:
             min_components = [self.adata.obs[key].nunique() for key in self.covariate_keys]
@@ -320,6 +401,19 @@ class ComponentOptimizer:
 
 
     def get_hyperparameter(self, idx):
+        """
+        Retrieve the hyperparameters of a specific trial based on its index in the sorted training history.
+        Args:
+            idx (int): The index of the trial in the sorted training history.
+        Returns:
+            dict: A dictionary containing the hyperparameters of the specified trial.
+        Raises:
+            IndexError: If the provided index is out of bounds for the training history.
+            KeyError: If the expected keys ('tid' or 'params') are missing in the trial data.
+        Notes:
+            - The training history is assumed to be sorted prior to fetching the trial.
+            - The method matches the trial in `self.trials` using the trial ID ('tid') from the history.
+        """
         # Fetch the sorted trial history
         history_df = self.get_train_history()
 
@@ -335,6 +429,28 @@ class ComponentOptimizer:
                 return trial['result']['params']
 
     def get_train_history(self):
+        """
+        Retrieves and processes the training history from the optimization trials.
+
+        This method extracts trial information, processes it into a structured format,
+        and returns a pandas DataFrame containing details about each trial, including
+        the parameters, scores, and derived metrics.
+
+        Returns:
+            pd.DataFrame: A DataFrame containing the following columns:
+                - n_components: The number of components used in the trial.
+                - n_covariate_components_X: Expanded columns for each covariate component (X is the index).
+                - n_total_components: The total number of components, calculated as the sum of 
+                  `n_components` and all `n_covariate_components`.
+                - score: The score (loss) of the trial.
+                - tid: The trial ID for tracking.
+                - Other columns corresponding to the trial parameters.
+
+        Notes:
+            - The DataFrame is sorted by the `score` column in descending order.
+            - The index of the DataFrame is reset after sorting.
+            - The columns are reordered to place `n_components` and related columns at the beginning.
+        """
         history = []
 
         # Extract trial information
@@ -372,6 +488,16 @@ class ComponentOptimizer:
 
 
     def fit_the_best_param(self):
+        """
+        Fits the ALPINE model using the best parameters found through Bayesian search.
+        This method initializes an ALPINE model with the best parameters stored in `self.best_param`
+        and fits it using the provided data and configuration.
+        Returns:
+            ALPINE: An instance of the ALPINE model fitted with the best parameters.
+        Raises:
+            RuntimeError: If the `best_param` attribute is not set. Ensure that `bayesian_search()` 
+                          is run prior to calling this method to determine the best parameters.
+        """
 
         if not hasattr(self, 'best_param'):
             raise RuntimeError("Please run bayesian_search() to find the best parameters first.")

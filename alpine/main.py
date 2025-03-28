@@ -13,6 +13,79 @@ from contextlib import nullcontext
 
 
 class ALPINE:
+    """
+    ALPINE: A class for performing matrix factorization with covariate components.
+    This class implements a matrix factorization model that incorporates covariate components 
+    to decompose input data into low-dimensional representations. It supports non-negative 
+    matrix factorization with optional orthogonality constraints and loss functions such as 
+    KL-divergence.
+    Attributes:
+        n_components (int): Number of components for the main factorization.
+        n_covariate_components (List[int]): List of integers specifying the number of components 
+            for each covariate.
+        alpha_W (float): Regularization parameter for the W matrix.
+        orth_W (float): Orthogonality constraint weight for the W matrix.
+        l1_ratio (float): Ratio of L1 regularization in the W matrix.
+        random_state (Optional[int]): Random seed for reproducibility.
+        gpu (bool): Whether to use GPU for computations.
+        device (torch.device): The device (CPU or GPU) used for computations.
+        loss_type (str): Loss function type ('kl-divergence' or 'frobenius').
+        eps (float): Small constant to avoid division by zero.
+        n_all_components (List[int]): List of all components (covariate + main).
+        total_components (int): Total number of components.
+        lam (List[float]): Regularization weights for covariate components.
+        scale_needed (bool): Whether to scale the decomposed matrices.
+        loss_history (pd.DataFrame): History of loss values during training.
+    Methods:
+        fit(X, covariate_keys, max_iter=None, batch_size=None, sample_weights=True, verbose=True, **kwargs):
+            Fits the model to the input data and covariates.
+        transform(X, n_iter=None, lam=None, use_label=True):
+            Transforms new data using the fitted model.
+        get_decomposed_matrices():
+            Returns the decomposed matrices (Ws, Hs, Bs).
+        get_W_and_H(idx=-1):
+            Returns the W and H matrices for a specific component.
+        W_concat(idx):
+            Concatenates W matrices for the specified indices.
+        H_concat(idx):
+            Concatenates H matrices for the specified indices.
+        get_conditional_gene_scores():
+            Computes conditional gene scores for each covariate.
+        get_reconstructed_counts(idx=[-1]):
+            Reconstructs the input data using the specified components.
+        get_normalized_expression(adata, library_size=1e+4):
+            Computes normalized expression values and stores them in the AnnData object.
+        compute_sig_assoc(covariate_key, sample_labels):
+            Computes significant associations between covariates and sample labels.
+        store_embeddings(adata, embedding_name=None):
+            Stores embeddings in the AnnData object.
+        _check_params():
+            Validates the input parameters.
+        _check_input():
+            Validates the input data and covariates.
+        _check_decomposed_matrices():
+            Initializes or validates the decomposed matrices.
+        _check_non_negative(X):
+            Checks if the input matrix is non-negative.
+        _process_lam(lam):
+            Processes the regularization parameter for covariates.
+        _process_input(X, y):
+            Processes the input data and covariates.
+        _to_dummies(y):
+            Converts categorical covariates to dummy variables.
+        _to_dummies_from_train(i, y):
+            Converts new covariates to dummy variables based on training data.
+        _kl_divergence(y, y_hat):
+            Computes the KL-divergence loss.
+        _get_best_max_iter(loss_history):
+            Determines the optimal number of iterations using the elbow method.
+        _fit(sample_weights, verbose):
+            Performs the matrix factorization.
+        _transform_wo_labels(X, n_iter=None, batch_size=None, lam=None):
+            Transforms new data without using covariate labels.
+        _transform(X, n_iter=None, batch_size=None, lam=None):
+            Transforms new data using covariate labels.
+    """
     
     def __init__(
         self,
@@ -56,7 +129,27 @@ class ALPINE:
             verbose: bool = True,
             **kwargs
         ) -> None:
-        
+        """
+        Fits the model to the given data and covariates.
+        Parameters:
+            X (ad.AnnData): The input data in AnnData format.
+            covariate_keys (Union[List[str], str]): Keys for covariates in the input data.
+            max_iter (Optional[int], optional): Maximum number of iterations for fitting. If not provided, it will be determined automatically. Defaults to None.
+            batch_size (Optional[int], optional): Batch size for processing. If not provided, it defaults to one-third of the number of features in X. Defaults to None.
+            sample_weights (bool, optional): Whether to use sample weights during fitting. Defaults to True.
+            verbose (bool, optional): Whether to display verbose output during fitting. Defaults to True.
+            **kwargs: Additional keyword arguments for specifying precomputed matrices:
+                - Ws: Precomputed W matrices.
+                - Hs: Precomputed H matrices.
+                - Bs: Precomputed B matrices.
+        Returns:
+            None: The function modifies the instance attributes in place.
+        Notes:
+            - If `max_iter` is not provided, the function will automatically determine the best value by performing an initial fit and analyzing the loss history.
+            - The function processes the input data and covariates, checks their validity, and initializes or validates decomposed matrices.
+            - If scaling is required, the function scales the W, H, and B matrices appropriately.
+            - The fitted matrices (W, H, B) are saved as instance attributes for further use.
+        """
         self.max_iter = max_iter
         self.X, self.y_input, self.condition_names = self._process_input(X, covariate_keys)
         self.y, self.y_labels, self.M_y = zip(*[self._to_dummies(yi) for yi in self.y_input])
@@ -107,7 +200,23 @@ class ALPINE:
             lam = None,
             use_label = True,
         ) -> List[np.ndarray]:
+        """
+        Transforms the input AnnData object using the specified parameters.
 
+        Parameters:
+            X (ad.AnnData): The input AnnData object to be transformed.
+            n_iter (Optional[int], optional): The number of iterations to perform. 
+                If None, defaults to 1000. If `use_label` is True and `n_iter` is None, 
+                an optimized number of iterations will be determined. Defaults to None.
+            lam (optional): A parameter used during the transformation. The specific 
+                purpose depends on the implementation of `_transform`.
+            use_label (bool, optional): If True, the transformation will use labels 
+                during processing. If False, the transformation will be performed 
+                without labels. Defaults to True.
+
+        Returns:
+            List[np.ndarray]: A list of numpy arrays resulting from the transformation.
+        """
         if n_iter is None:
             n_iter = 1000
 
@@ -120,12 +229,39 @@ class ALPINE:
 
 
     def get_decomposed_matrices(self) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+        """
+        Retrieve the decomposed matrices (Ws, Hs, Bs) from the model.
+
+        Returns:
+            Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+                - A deep copy of the list of W matrices.
+                - A deep copy of the list of H matrices.
+                - A deep copy of the list of B matrices.
+
+        Raises:
+            RuntimeError: If the model has not been fitted yet. Ensure that the `fit()` 
+                          method is called before invoking this method.
+        """
         if not hasattr(self, 'Ws') or not hasattr(self, 'Hs') or not hasattr(self, 'Bs'):
             raise RuntimeError("Model has not been fitted. Call fit() before get_decomposed_matrices().")
         return deepcopy(self.Ws), deepcopy(self.Hs), deepcopy(self.Bs)
     
 
     def get_W_and_H(self, idx: int = -1) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Retrieve the W and H matrices from the model.
+
+        Parameters:
+            idx (int): The index of the matrices to retrieve. Defaults to -1, 
+                       which retrieves the last set of matrices.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: A tuple containing the W and H matrices.
+
+        Raises:
+            RuntimeError: If the model has not been fitted and the W and H matrices 
+                          are not available.
+        """
         if not hasattr(self, 'W') or not hasattr(self, 'H'):
             raise RuntimeError("Model has not been fitted. Call fit() before get_W_and_H().")
         return deepcopy(self.Ws[idx]), deepcopy(self.Hs[idx])
@@ -140,6 +276,18 @@ class ALPINE:
 
 
     def get_conditional_gene_scores (self):
+        """
+        Calculate conditional gene scores for each set of matrices in the model.
+
+        This method computes the conditional gene scores by performing matrix 
+        multiplications and normalizations for each set of matrices (Ws, Hs, and y) 
+        in the model. The resulting scores are stored in a list of pandas DataFrames.
+
+        Returns:
+            List[pd.DataFrame]: A list of DataFrames where each DataFrame contains 
+            the conditional gene scores for a corresponding set of matrices. The 
+            columns of each DataFrame are labeled using the corresponding y_labels.
+        """
         conditional_gene_scores = []
         for i in range(len(self.Bs)):
             gene_scores = (self.Ws[i] @ self.Hs[i] @ self.y[i].T) / self.y[i].sum(axis=1)
@@ -148,16 +296,67 @@ class ALPINE:
 
 
     def get_reconstructed_counts(self, idx:Optional[List[int]] = [-1]):
+        """
+        Compute the reconstructed counts by summing the matrix products of Ws and Hs 
+        for the specified indices.
+
+        Args:
+            idx (Optional[List[int]]): A list of indices specifying which matrices 
+                to include in the reconstruction. Defaults to [-1], which typically 
+                indicates the last element or a specific convention in the context 
+                of the implementation.
+
+        Returns:
+            np.ndarray: The reconstructed counts as a 2D NumPy array obtained by 
+            summing the matrix products of Ws and Hs for the specified indices.
+        """
         return np.sum([self.Ws[i] @ self.Hs[i] for i in idx], axis=0)
 
     
     def get_normalized_expression(self, adata, library_size=1e+4):
+        """
+        Normalize the expression data using a specified library size.
+
+        This method computes the normalized expression matrix from the 
+        ALPINE embedding and stores it in the `obsm` attribute of the 
+        AnnData object.
+
+        Parameters:
+            adata (AnnData): The annotated data matrix containing the 
+                ALPINE embedding in `obsm["ALPINE_embedding"]`.
+            library_size (float, optional): The target sum for normalization. 
+                Default is 1e+4.
+
+        Returns:
+            None: The normalized expression matrix is stored in 
+            `adata.obsm["normalized_expression"]`.
+        """
         expression =  adata.obsm["ALPINE_embedding"] @ self.Ws[-1].T
         exp = ad.AnnData(expression)
         sc.pp.normalize_total(exp, target_sum=library_size)
         adata.obsm["normalized_expression"] = exp.X
     
     def compute_sig_assoc(self, covariate_key: str, sample_labels: pd.Series):
+        """
+        Compute significant associations between a covariate and sample labels.
+        This method calculates the significant associations for a given covariate
+        key by projecting the sample labels onto the corresponding matrix `H` 
+        associated with the covariate in the model.
+        Args:
+            covariate_key (str): The key identifying the covariate in the model.
+                                 Must exist in `self.condition_names`.
+            sample_labels (pd.Series): A pandas Series containing the sample labels
+                                       to be analyzed. These labels will be one-hot
+                                       encoded.
+        Returns:
+            pd.DataFrame: A DataFrame containing the significant associations, where
+                          rows correspond to the components of the covariate and 
+                          columns correspond to the unique sample labels.
+        Raises:
+            ValueError: If the `covariate_key` does not exist in `self.condition_names`.
+            ValueError: If the number of samples in `sample_labels` does not match
+                        the number of samples in the model.
+        """
         
         if covariate_key not in self.condition_names:
             raise ValueError("The covariate key does not exist in the model.")
@@ -175,6 +374,31 @@ class ALPINE:
         return sig_assoc_df
 
     def store_embeddings(self, adata: ad.AnnData, embedding_name: Optional[Union[List[str], str]] = None):
+        """
+        Stores the embeddings from the decomposition into the provided AnnData object.
+
+        Parameters:
+        -----------
+        adata : ad.AnnData
+            The AnnData object where the embeddings will be stored.
+        embedding_name : Optional[Union[List[str], str]], default=None
+            The names of the embeddings to be stored. If a single string is provided, it will be
+            converted to a list. The length of `embedding_name` must match the number of decomposed
+            matrices (`self.n_all_components`). If not provided, the method will use `self.condition_names`
+            as the embedding names.
+
+        Raises:
+        -------
+        ValueError
+            If `embedding_name` is provided but its length does not match the number of decomposed matrices.
+        ValueError
+            If `embedding_name` is not provided and `self.condition_names` is not defined.
+
+        Notes:
+        ------
+        - The embeddings are stored in the `obsm` and `varm` attributes of the AnnData object.
+        - The last embedding is always stored with the key "ALPINE_embedding" in both `obsm` and `varm`.
+        """
         if embedding_name is not None:
             if isinstance(embedding_name, str):
                 embedding_name = [embedding_name]
@@ -477,6 +701,27 @@ class ALPINE:
         batch_size = None,
         lam = None        
     ):
+        """
+        Perform data transformation without labels using non-negative matrix factorization (NMF).
+        This method applies NMF to transform the input data `X` into a lower-dimensional representation
+        using pre-trained weight matrices (`Ws`). The transformed data is stored in the `obsm` and `varm`
+        attributes of the input AnnData object.
+        Args:
+            X (ad.AnnData): The input AnnData object containing the data to be transformed.
+            n_iter (Optional[int], optional): The number of iterations for the NMF update rule. Defaults to None.
+            batch_size (optional): Not used in this method. Defaults to None.
+            lam (optional): Not used in this method. Defaults to None.
+        Returns:
+            Tuple[List[np.ndarray], Any]: 
+                - A list of transformed matrices (`Hs_new`) corresponding to each condition.
+                - An additional return value (`_`), which is not explicitly documented in this method.
+        Notes:
+            - The method initializes random matrices for the latent factors (`H`) and updates them iteratively
+              using the multiplicative update rule for NMF.
+            - The transformed matrices are stored in the `obsm` and `varm` attributes of the input AnnData object
+              under keys corresponding to the condition names and the "ALPINE_embedding".
+            - The method ensures reproducibility by setting the random seed if `self.random_state` is provided.
+        """
         if self.random_state is not None:
             torch.manual_seed(self.random_state)
             if torch.cuda.is_available():
