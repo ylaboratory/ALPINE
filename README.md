@@ -142,9 +142,9 @@ There are additional applications for our model; please refer to the next sectio
 All analyses from the papers and case studies are stored in the ALPINE-analysis repository, where you can access a variety of resources. Additionally, the repository provides valuable tips for tuning the model.
 
 - [ALPINE-anlaysis repo](https://github.com/ylaboratory/ALPINE-analysis)
-- Save, load, and extend the optimization process.
-- Retrieve condition-associated gene scores.
-- Transform new, unseen data using the trained model.
+    - Save, load, and extend the optimization process.
+    - Retrieve condition-associated gene scores.
+    - Transform new, unseen data using the trained model.
 
 ## Citation
 
