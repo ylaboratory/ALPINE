@@ -1,10 +1,13 @@
 [tool.poetry]
 name = "alpine"
 version = "0.1.0"
-description = ""
+description = "ALPINE is a semi-supervised non-negative matrix factorization (NMF) framework designed to effectively distinguish between multiple phenotypic conditions based on shared biological factors, while also providing direct interpretability of condition-associated genes."
 authors = [
-  "weihaolee <wl61@rice.edu>",
-  "lechuanli <ll84@rice.edu>"
+  "Wei-Hao Lee <steve24563@gmail.com>",
+  "Wei-Hao Lee <wl61@rice.edu>",
+  "Lechuan Li <ll84@rice.edu>",
+  "Ruth Dannenfelser <rtdn@rice.edu>",
+  "Vicky Yao <vy@rice.edu>"
 ]
 readme = "README.md"
 
@@ -18,12 +21,6 @@ tqdm = "^4.66.5"
 hyperopt = "^0.2.7"
 pandas = "^2.2.3"
 kneed = "^0.8.5"
-#torch = {version = "^2.4.1+cu124", source = "pytorch"}
-
-# [[tool.poetry.source]]
-# name = "pytorch"
-# url = "https://download.pytorch.org/whl/cu124"
-# priority = "explicit"
 torch = "^2.5.1"
 
 [build-system]
