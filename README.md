@@ -12,6 +12,19 @@ ALPINE can be useful for:
 
 The ALPINE preprint is now available; please review the article at [link](https://www.biorxiv.org/content/10.1101/2025.02.15.638471v1).
 
+**Contents**:
+
+- [ALPINE](#alpine)
+  - [Installation](#installation)
+  - [Usage](#usage)
+    - [1. Optimization](#1-optimization)
+    - [2. Multi-condition disentangle using ALPINE](#2-multi-condition-disentangle-using-alpine)
+      - [a. Training the model](#a-training-the-model)
+      - [b. Get the decomposed matrices and counts](#b-get-the-decomposed-matrices-and-counts)
+  - [More usage, and analysis](#more-usage-and-analysis)
+  - [Citation](#citation)
+  - [Overview of ALPINE](#overview-of-alpine)
+
 ## Installation
 
 Currently, `ALPINE` is not yet available on the PyPI repository. However, users can clone the entire repository and install the package in their environment by running:
@@ -141,12 +154,16 @@ There are additional applications for our model; please refer to the next sectio
 
 All analyses from the papers and case studies are stored in the ALPINE-analysis repository, where you can access a variety of resources. Additionally, the repository provides valuable tips for tuning the model.
 
-- [ALPINE-anlaysis repo](https://github.com/ylaboratory/ALPINE-analysis)
-    - Save, load, and extend the optimization process.
-    - Retrieve condition-associated gene scores.
-    - Transform new, unseen data using the trained model.
+- [ALPINE-anlaysis repository](https://github.com/ylaboratory/ALPINE-analysis) provdes following tutorials:
+  - Save, load, and extend the optimization process.
+  - Retrieve condition-associated gene scores.
+  - Transform new, unseen data using the trained model.
 
 ## Citation
 
 If you use our tool in your study, please cite the following paper:
 > Lee WH, Li L, Dannenfelser R, Yao V. Interpretable phenotype decoding from multi-condition sequencing data with ALPINE. bioRxiv. 2025:2025-02.
+
+## Overview of ALPINE
+
+![overview](./imgs/figure1.png)
