@@ -23,7 +23,6 @@ The ALPINE preprint is now available; please review the article at [link](https:
       - [b. Get the decomposed matrices and counts](#b-get-the-decomposed-matrices-and-counts)
   - [More usage, and analysis](#more-usage-and-analysis)
   - [Citation](#citation)
-  - [Overview of ALPINE](#overview-of-alpine)
 
 ## Installation
 
@@ -164,6 +163,6 @@ All analyses from the papers and case studies are stored in the ALPINE-analysis 
 If you use our tool in your study, please cite the following paper:
 > Lee WH, Li L, Dannenfelser R, Yao V. Interpretable phenotype decoding from multi-condition sequencing data with ALPINE. bioRxiv. 2025:2025-02.
 
-## Overview of ALPINE
+<!-- ## Overview of ALPINE
 
-![overview](./imgs/figure1.png)
+![overview](./imgs/figure1.png) -->
