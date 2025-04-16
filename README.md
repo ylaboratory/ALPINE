@@ -1,4 +1,4 @@
-![ALPINE](./assests/alpine_icon.png)
+<img src="assests/alpine_icon.png" alt="ALPINE icon" width="200" height="200"/>
 
 # ALPINE
 
