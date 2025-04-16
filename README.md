@@ -1,3 +1,5 @@
+![ALPINE](./assests/alpine_icon.png)
+
 # ALPINE
 
 **ALPINE: Adaptive Layering of Phenotypic and Integrative Noise Extraction**
