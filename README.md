@@ -14,6 +14,11 @@ ALPINE can be useful for:
 
 The ALPINE preprint is now available; please review the article at [link](https://www.biorxiv.org/content/10.1101/2025.02.15.638471v1).
 
+> [!NOTE]
+> 1. The `get_normalized_expression` function now saves the normalized counts in `adata.layers["normalized_expression"]` instead of `adata.obsm["normalized_expression"]`.
+> 2. The `bayesian_search` method in the `ComponentOptimizer` class has been renamed to `search_hyperparams`.
+> 3. The `gpu` argument in both `ALPINE` and `ComponentOptimizer` has been replaced with a `device` argument. Users can now manually specify the device to use (e.g., `"cpu"`, `"cuda"`, or `"mps"`). macOS users with Apple Silicon can try `"mps"` to leverage the GPU on M-series chips.
+
 **Contents**:
 
 - [ALPINE](#alpine)

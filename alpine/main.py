@@ -10,6 +10,7 @@ from typing import Optional, Union, List, Tuple
 from copy import deepcopy
 from sklearn.utils.class_weight import compute_sample_weight
 from contextlib import nullcontext
+from .utils.sampling import generate_epoch_indices, get_batch_indices, get_num_batches, create_joint_labels_from_dummy_matrices
 
 
 class ALPINE:
@@ -53,7 +54,7 @@ class ALPINE:
             Computes conditional gene scores for each covariate.
         get_reconstructed_counts(idx=[-1]):
             Reconstructs the input data using the specified components.
-        get_normalized_expression(adata, library_size=1e+4):
+        get_normalized_expression(adata, library_size=None):
             Computes normalized expression values and stores them in the AnnData object.
         compute_sig_assoc(covariate_key, sample_labels):
             Computes significant associations between covariates and sample labels.
@@ -90,12 +91,12 @@ class ALPINE:
     def __init__(
         self,
         n_covariate_components: Union[List[int], int] ,
-        n_components: int = 30,
+        n_components: int,
         alpha_W = 0,
         orth_W = 0, 
         l1_ratio = 0,
         lam: Optional[Union[List[float], List[int], float, int]] = None,
-        gpu: bool = True,
+        device: str = "cuda",
         scale_needed: bool = True,
         loss_type = 'kl-divergence',
         random_state: Optional[int] = 42,
@@ -109,8 +110,7 @@ class ALPINE:
         self.orth_W= orth_W
         self.l1_ratio = l1_ratio
         self.random_state = random_state
-        self.gpu = gpu
-        self.device = torch.device("cuda" if self.gpu and torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device)
         self.loss_type = loss_type
         self.eps = eps
         self.n_all_components = self.n_covariate_components + [self.n_components]
@@ -164,7 +164,7 @@ class ALPINE:
         # Automatically search for the best max_iter if not provided
         if max_iter is None:
             # for the scanning purpose
-            self.max_iter = 200
+            self.max_iter = 1000
             _, _, _ = self._fit(sample_weights, verbose=False)
             self.max_iter = self._get_best_max_iter(self.loss_history)
             
@@ -313,28 +313,37 @@ class ALPINE:
         return np.sum([self.Ws[i] @ self.Hs[i] for i in idx], axis=0)
 
     
-    def get_normalized_expression(self, adata, library_size=1e+4):
+    def get_normalized_expression(self, adata, library_size=None):
         """
-        Normalize the expression data using a specified library size.
-
-        This method computes the normalized expression matrix from the 
-        ALPINE embedding and stores it in the `obsm` attribute of the 
-        AnnData object.
-
-        Parameters:
-            adata (AnnData): The annotated data matrix containing the 
-                ALPINE embedding in `obsm["ALPINE_embedding"]`.
-            library_size (float, optional): The target sum for normalization. 
-                Default is 1e+4.
-
-        Returns:
-            None: The normalized expression matrix is stored in 
-            `adata.obsm["normalized_expression"]`.
+        Computes and stores normalized gene expression values based on the ALPINE embedding.
+        Parameters
+        ----------
+        adata : AnnData
+            The annotated data matrix. Must contain 'ALPINE_embedding' in `adata.obsm`.
+        library_size : float or None, optional (default: None)
+            The target sum for normalization. If provided, expression values are normalized
+            so that the total expression per cell equals `library_size`. Must be a positive number.
+        Raises
+        ------
+        ValueError
+            If 'ALPINE_embedding' is not found in `adata.obsm`.
+            If `library_size` is provided and is not a positive number.
+        Notes
+        -----
+        The normalized expression matrix is stored in `adata.obsm['normalized_expression']`.
+        Requires `scanpy` as `sc` and `anndata` as `ad` to be imported.
         """
+
+        if "ALPINE_embedding" not in adata.obsm:
+            raise ValueError("ALPINE_embedding not found in adata.obsm. Please run ALPINE.fit() or ALPINE.transform() first.")
+        
         expression =  adata.obsm["ALPINE_embedding"] @ self.Ws[-1].T
         exp = ad.AnnData(expression)
-        sc.pp.normalize_total(exp, target_sum=library_size)
-        adata.obsm["normalized_expression"] = exp.X
+        if library_size is not None:
+            if library_size <= 0:
+                raise ValueError("library_size must be a positive number.")
+            sc.pp.normalize_total(exp, target_sum=library_size)
+        adata.layers["normalized_expression"] = exp.X
     
     def compute_sig_assoc(self, covariate_key: str, sample_labels: pd.Series):
         """
@@ -528,11 +537,13 @@ class ALPINE:
         else:
             return np.sum(y * np.log(np.clip(y / np.clip(y_hat, a_min=self.eps, a_max=None), a_min=self.eps, a_max=None)) - y + y_hat)
 
-
+    # TODO: leave the current as default and another option
     def _get_best_max_iter (self, loss_history):
+
         kneedle = KneeLocator(np.arange(0, loss_history.shape[0]), 
-                              np.log10(loss_history["reconstruction_loss"].values), 
-                              curve='convex', direction='decreasing')
+                            np.log10(loss_history["reconstruction_loss"].values),
+                            # loss_history["reconstruction_loss"].values, 
+                            curve='convex', direction='decreasing')
         return kneedle.elbow
     
 
@@ -567,119 +578,121 @@ class ALPINE:
             orthogonal_matrix[start_idx:end_idx, start_idx:end_idx] = weights * torch.ones(k, k, device=self.device) - torch.eye(k, device=self.device)
             start_idx = end_idx
 
+        
         pbar = tqdm(total=self.max_iter, desc="Epoch", ncols=150) if verbose else nullcontext()
-        with pbar:
-            for _ in range(self.max_iter):
-                for _ in range(0, n_sample, self.batch_size):
-                    if isinstance(sample_weights, bool) and sample_weights:
-                        joint_labels = ["+".join(str(y.iloc[j]) for y in self.y_input) for j in range(len(self.y_input[0]))]
-                        sample_weights = compute_sample_weight(class_weight='balanced', y=joint_labels)
-                        sample_weights = torch.tensor(sample_weights / np.sum(sample_weights), dtype=torch.float32, device=self.device)
-                        indices = torch.multinomial(sample_weights, min(self.batch_size, len(sample_weights)), replacement=False)
+        with torch.no_grad():
+            with pbar:
+                for _ in range(self.max_iter):
+                    for _ in range(0, n_sample, self.batch_size):
+                        if isinstance(sample_weights, bool) and sample_weights:
+                            joint_labels = ["+".join(str(y.iloc[j]) for y in self.y_input) for j in range(len(self.y_input[0]))]
+                            sample_weights = compute_sample_weight(class_weight='balanced', y=joint_labels)
+                            sample_weights = torch.tensor(sample_weights / np.sum(sample_weights), dtype=torch.float32, device=self.device)
+                            indices = torch.multinomial(sample_weights, min(self.batch_size, len(sample_weights)), replacement=False)
+                        else:
+                            indices = torch.randperm(n_sample, device=self.device)[:self.batch_size]
+
+                        X_sub = X[:, indices]
+                        Hs_sub = [h[:, indices] for h in Hs]
+                        y_sub = [_y[:, indices] for _y in y]
+                        M_y_sub = [m[:, indices] for m in M_y]
+
+                        # update W
+                        W = torch.cat(Ws, dim=1)
+                        H_sub = torch.cat(Hs_sub, dim=0)
+
+                        W_numerator = 2 * X_sub @ H_sub.T
+                        # W_denominator = W @ H_sub @ H_sub.T
+
+                        # orthogonal constraint + l2 norm
+                        W_denominator = W @ (2 * H_sub @ H_sub.T +  (1 - self.l1_ratio) * self.alpha_W * torch.eye(self.total_components, device=self.device) + orthogonal_matrix)
+
+                        # orthogonal constraint
+                        # W_denominator = W @ (H_sub @ H_sub.T + orthogonal_matrix)
+
+                        # l1 norm
+                        W_denominator += self.l1_ratio * self.alpha_W * torch.ones_like(W_denominator)
+
+                        # orthogonal on the entire W
+                        # W_denominator = W @ (H_sub @ H_sub.T + self.alpha_W * (torch.ones_like(H_sub @ H_sub.T) - torch.eye(H_sub.shape[0], device=self.device)))
+
+
+
+                        W *= torch.div(torch.clamp(W_numerator, min=self.eps), torch.clamp(W_denominator, min=self.eps))
+
+                        start_idx = 0
+                        for idx, w in enumerate(Ws):
+                            end_idx = start_idx + w.shape[1]
+                            Ws[idx] = W[:, start_idx:end_idx]
+                            start_idx = end_idx
+
+                        for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
+                            if self.loss_type == "kl-divergence":
+                                B_numerator = self.lam[b] * torch.div((M * y_b), torch.clamp(M * (B_b @ H_b), min=self.eps)) @ H_b.T
+                                B_denominator = self.lam[b] * torch.ones_like(y_b) @ H_b.T
+                            else:
+                                B_numerator = 2 * (M * y_b) @ H_b.T
+                                B_denominator = 2 * (M * (B_b @ H_b)) @ H_b.T
+
+                            Bs[b] *= torch.div(torch.clamp(B_numerator, min=self.eps), torch.clamp(B_denominator, min=self.eps))
+
+
+                        # update partial H
+                        H_label_numerator = torch.zeros_like(H_sub) + self.eps
+                        H_label_denominator = torch.zeros_like(H_sub) + self.eps
+
+                        start_idx = 0
+                        for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
+                            end_idx = start_idx + H_b.shape[0]
+                            if self.loss_type == "kl-divergence":
+                                H_numerator = self.lam[b] * B_b.T @ torch.div((M * y_b), torch.clamp(M *(B_b @ H_b), min=self.eps))
+                                H_denominator = self.lam[b] * B_b.T @ torch.ones_like(y_b)
+                            else:
+                                H_numerator = 2 * self.lam[b] * B_b.T @ (M * y_b)
+                                H_denominator = 2 * self.lam[b] * B_b.T @ (M * (B_b @ H_b))
+
+                            H_label_numerator[start_idx:end_idx] += H_numerator
+                            H_label_denominator[start_idx:end_idx] += H_denominator
+                            start_idx = end_idx
+
+                        # update H
+                        W = torch.cat(Ws, dim=1)
+                        H_bio_numerator = 2 * W.T @ X_sub
+                        H_bio_denominator = 2 * W.T @ W @ H_sub
+
+                        numerator = torch.clamp(H_bio_numerator + H_label_numerator, min=self.eps)
+                        denominator = torch.clamp(H_bio_denominator + H_label_denominator, min=self.eps)
+                        H_sub *= torch.div(numerator, denominator)
+
+                        start_idx = 0
+                        for idx, h in enumerate(Hs):
+                            end_idx = start_idx + h.shape[0]
+                            h[:, indices] = H_sub[start_idx:end_idx]
+                            start_idx = end_idx
+
+
+                    # loss calculation
+                    # all the loss calculate on cpu
+                    W = torch.cat(Ws, dim=1)
+                    H = torch.cat(Hs, dim=0)
+                    recon_loss = torch.norm(X - W @ H, 'fro')**2
+
+                    if self.loss_type == "kl-divergence":
+                        label_loss = [self._kl_divergence(_y, _b @ _h) for _y, _b, _h in zip(y, Bs, Hs)]
                     else:
-                        indices = torch.randperm(n_sample, device=self.device)[:self.batch_size]
+                        label_loss = [torch.norm(_y - _b @ _h, 'fro')**2 for _y, _b, _h in zip(y, Bs, Hs)]
 
-                    X_sub = X[:, indices]
-                    Hs_sub = [h[:, indices] for h in Hs]
-                    y_sub = [_y[:, indices] for _y in y]
-                    M_y_sub = [m[:, indices] for m in M_y]
+                    weighted_label_loss = [self.lam[i] * ll for i, ll in enumerate(label_loss)]
+                    label_total_loss = torch.sum(torch.stack(weighted_label_loss))
+                    loss = recon_loss + label_total_loss
+                    loss_history.append([recon_loss.item()] + [l.item() for l in weighted_label_loss] + [loss.item()])
 
-                    # update W
-                    W = torch.cat(Ws, dim=1)
-                    H_sub = torch.cat(Hs_sub, dim=0)
+                    # update lambda
+                    # self.lam = [torch.clamp(self.lam[i]-0.01*torch.log(1 + label_loss[i]), min=self.eps).item() for i in range(len(self.lam))]
 
-                    W_numerator = X_sub @ H_sub.T
-                    # W_denominator = W @ H_sub @ H_sub.T
-
-                    # orthogonal constraint + l2 norm
-                    W_denominator = W @ (H_sub @ H_sub.T +  (1 - self.l1_ratio) * self.alpha_W * torch.eye(self.total_components, device=self.device) + orthogonal_matrix)
-
-                    # orthogonal constraint
-                    # W_denominator = W @ (H_sub @ H_sub.T + orthogonal_matrix)
-
-                    # l1 norm
-                    W_denominator += self.l1_ratio * self.alpha_W * torch.ones_like(W_denominator)
-
-                    # orthogonal on the entire W
-                    # W_denominator = W @ (H_sub @ H_sub.T + self.alpha_W * (torch.ones_like(H_sub @ H_sub.T) - torch.eye(H_sub.shape[0], device=self.device)))
-
-
-
-                    W *= torch.div(torch.clamp(W_numerator, min=self.eps), torch.clamp(W_denominator, min=self.eps))
-
-                    start_idx = 0
-                    for idx, w in enumerate(Ws):
-                        end_idx = start_idx + w.shape[1]
-                        Ws[idx] = W[:, start_idx:end_idx]
-                        start_idx = end_idx
-
-                    for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
-                        if self.loss_type == "kl-divergence":
-                            B_numerator = torch.div((M * y_b), torch.clamp(M * (B_b @ H_b), min=self.eps)) @ H_b.T
-                            B_denominator = torch.ones_like(y_b) @ H_b.T
-                        else:
-                            B_numerator = (M * y_b) @ H_b.T
-                            B_denominator = (M * (B_b @ H_b)) @ H_b.T
-
-                        Bs[b] *= torch.div(torch.clamp(B_numerator, min=self.eps), torch.clamp(B_denominator, min=self.eps))
-
-
-                    # update partial H
-                    H_label_numerator = torch.zeros_like(H_sub) + self.eps
-                    H_label_denominator = torch.zeros_like(H_sub) + self.eps
-
-                    start_idx = 0
-                    for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
-                        end_idx = start_idx + H_b.shape[0]
-                        if self.loss_type == "kl-divergence":
-                            H_numerator = self.lam[b] * B_b.T @ torch.div((M * y_b), torch.clamp(M *(B_b @ H_b), min=self.eps))
-                            H_denominator = self.lam[b] * B_b.T @ torch.ones_like(y_b)
-                        else:
-                            H_numerator = 2 * self.lam[b] * B_b.T @ (M * y_b)
-                            H_denominator = 2 * self.lam[b] * B_b.T @ (M * (B_b @ H_b))
-
-                        H_label_numerator[start_idx:end_idx] += H_numerator
-                        H_label_denominator[start_idx:end_idx] += H_denominator
-                        start_idx = end_idx
-
-                    # update H
-                    W = torch.cat(Ws, dim=1)
-                    H_bio_numerator = 2 * W.T @ X_sub
-                    H_bio_denominator = 2 * W.T @ W @ H_sub
-
-                    numerator = torch.clamp(H_bio_numerator + H_label_numerator, min=self.eps)
-                    denominator = torch.clamp(H_bio_denominator + H_label_denominator, min=self.eps)
-                    H_sub *= torch.div(numerator, denominator)
-
-                    start_idx = 0
-                    for idx, h in enumerate(Hs):
-                        end_idx = start_idx + h.shape[0]
-                        h[:, indices] = H_sub[start_idx:end_idx]
-                        start_idx = end_idx
-
-
-                # loss calculation
-                # all the loss calculate on cpu
-                W = torch.cat(Ws, dim=1)
-                H = torch.cat(Hs, dim=0)
-                recon_loss = torch.norm(X - W @ H, 'fro')**2
-
-                if self.loss_type == "kl-divergence":
-                    label_loss = [self._kl_divergence(_y, _b @ _h) for _y, _b, _h in zip(y, Bs, Hs)]
-                else:
-                    label_loss = [torch.norm(_y - _b @ _h, 'fro')**2 for _y, _b, _h in zip(y, Bs, Hs)]
-
-                weighted_label_loss = [self.lam[i] * ll for i, ll in enumerate(label_loss)]
-                label_total_loss = torch.sum(torch.stack(weighted_label_loss))
-                loss = recon_loss + label_total_loss
-                loss_history.append([recon_loss.item()] + [l.item() for l in weighted_label_loss] + [loss.item()])
-
-                # update lambda
-                # self.lam = [torch.clamp(self.lam[i]-0.01*torch.log(1 + label_loss[i]), min=self.eps).item() for i in range(len(self.lam))]
-
-                if verbose:
-                    pbar.set_postfix({"objective loss": loss.item()})
-                    pbar.update(1)
+                    if verbose:
+                        pbar.set_postfix({"objective loss": loss.item()})
+                        pbar.update(1)
 
         Ws = [_w.cpu().numpy() for _w in Ws]
         Hs = [_h.cpu().numpy() for _h in Hs]

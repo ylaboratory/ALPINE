@@ -9,50 +9,13 @@ from sklearn.metrics.cluster import adjusted_rand_score, homogeneity_score
 from hyperopt import fmin, tpe, hp, Trials, STATUS_OK, STATUS_FAIL
 from .main import ALPINE
 from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import silhouette_score
+from scipy.spatial.distance import pdist, squareform
+from joblib import Parallel, delayed
+import warnings
 
 class ComponentOptimizer:
-    """
-    ComponentOptimizer is a class designed for optimizing the parameters of the ALPINE model using Bayesian optimization. 
-    It provides methods for calculating ARI scores, assigning components, performing Bayesian searches, and managing trials.
-    Attributes:
-        adata (AnnData): The annotated data matrix.
-        covariate_keys (list): List of covariate keys used for stratification.
-        loss_type (str): The type of loss function to use. Default is 'kl-divergence'.
-        max_iter (int or None): Maximum number of iterations for model training. If None, it will be detected dynamically.
-        batch_size (int or None): Batch size for training. Default is None.
-        gpu (bool): Whether to use GPU for training. Default is True.
-        random_state (int or None): Random seed for reproducibility. Default is None.
-        best_param (dict): Stores the best parameters found during optimization.
-        minimum_set_param (dict): Stores the minimum set of parameters.
-        min_components (list): Minimum number of components for each covariate.
-        weight_reduce_covar_dims (float): Weight for penalizing the number of covariate components.
-        iter_records (list): Records of iterations during training.
-        n_splits (int or None): Number of splits for cross-validation.
-        trials (Trials): Stores the trials object for Bayesian optimization.
-        space (dict): Search space for Bayesian optimization.
-    Methods:
-        calc_ari(args):
-            Calculates the Adjusted Rand Index (ARI) and homogeneity score for the given parameters.
-        n_component_assignment(x, min_components):
-            Assigns the number of components for the model based on the given ratios and minimum components.
-        objective(space):
-            Objective function for Bayesian optimization. Calculates the loss based on ARI and penalizes covariate dimensions.
-        bayesian_search(n_total_components_range, lam_power_range, alpha_W_range, orth_W_range, l1_ratio_range, 
-                        weight_reduce_covar_dims, n_splits, max_evals, min_components, trials_filename):
-            Performs Bayesian optimization to find the best hyperparameters for the model.
-        extend_training(extra_evals):
-            Extends the Bayesian optimization process with additional evaluations.
-        save_trials(filename):
-            Saves the current trials to a file.
-        load_trials(filename):
-            Loads trials from a file.
-        get_hyperparameter(idx):
-            Retrieves the hyperparameters of a specific trial by index.
-        get_train_history():
-            Retrieves the training history as a pandas DataFrame, including trial details and scores.
-        fit_the_best_param():
-            Fits the ALPINE model using the best parameters found during Bayesian optimization.
-    """
+    
     def __init__(
             self,
             adata,
@@ -60,7 +23,7 @@ class ComponentOptimizer:
             loss_type='kl-divergence',
             max_iter=None,
             batch_size=None,
-            gpu=True,
+            device="cuda",
             random_state=None
         ):
         self.adata = adata.copy()
@@ -68,7 +31,7 @@ class ComponentOptimizer:
         self.loss_type = loss_type
         self.max_iter = max_iter
         self.random_state = random_state
-        self.gpu = gpu
+        self.device = device
         self.batch_size = batch_size
         self.best_param = {}
         self.minimum_set_param = {}
@@ -114,7 +77,7 @@ class ComponentOptimizer:
                     l1_ratio=l1_ratio,
                     random_state=self.random_state,
                     loss_type=self.loss_type,
-                    gpu=self.gpu,
+                    device=self.device,
                 )
                 
                 model.fit(X=train_adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, batch_size=self.batch_size, verbose=False)
@@ -122,15 +85,19 @@ class ComponentOptimizer:
                 _ = model.transform(val_adata, use_label=False)
 
                 sc.pp.neighbors(val_adata, use_rep='ALPINE_embedding')
-                sc.tl.leiden(val_adata, flavor="igraph")
+                # scores.append(self.calc_ARI_score(val_adata))
 
-                fold_score = 0
+                sc.tl.leiden(val_adata, flavor="igraph", resolution=5)
+                score = 0
                 for key in self.covariate_keys:
                     selected_idx = ~val_adata.obs[key].isna()
-                    fold_score += adjusted_rand_score(val_adata.obs[key][selected_idx], val_adata.obs["leiden"][selected_idx])
-                    fold_score += homogeneity_score(val_adata.obs[key][selected_idx], val_adata.obs["leiden"][selected_idx])
-                scores.append(fold_score / len(self.covariate_keys))
-                
+                    score += adjusted_rand_score(val_adata.obs[key][selected_idx], val_adata.obs["leiden"][selected_idx])
+                    score += homogeneity_score(val_adata.obs[key][selected_idx], val_adata.obs["leiden"][selected_idx])
+                score /= len(self.covariate_keys)
+
+                scores.append(score)
+
+
                 if self.max_iter_detect:
                     self.iter_records.append(model.max_iter)
 
@@ -146,7 +113,7 @@ class ComponentOptimizer:
                 l1_ratio=l1_ratio,
                 random_state=self.random_state,
                 loss_type=self.loss_type,
-                gpu=self.gpu,
+                device=self.device,
             )
 
             adata = self.adata.copy()
@@ -154,46 +121,43 @@ class ComponentOptimizer:
             model.store_embeddings(adata)
 
             sc.pp.neighbors(adata, use_rep='ALPINE_embedding')
-            sc.tl.leiden(adata, flavor="igraph")
-
+            # score = self.calc_ARI_score(adata)
+            sc.tl.leiden(adata, flavor="igraph", resolution=1)
             score = 0
             for key in self.covariate_keys:
                 selected_idx = ~adata.obs[key].isna()
                 score += adjusted_rand_score(adata.obs[key][selected_idx], adata.obs["leiden"][selected_idx])
                 score += homogeneity_score(adata.obs[key][selected_idx], adata.obs["leiden"][selected_idx])
             score /= len(self.covariate_keys)
-
+        
             if self.max_iter_detect:
                 self.iter_records.append(model.max_iter)
 
         return score
 
+    def calc_ARI_score(self, adata, n=10):
 
+        def score_for_res(res):
+            adata_copy = adata.copy()
+            sc.tl.leiden(adata_copy, flavor="igraph", resolution=res)
+            score = 0
+            for key in self.covariate_keys:
+                selected_idx = ~adata_copy.obs[key].isna()
+                score += adjusted_rand_score(adata_copy.obs[key][selected_idx], adata_copy.obs["leiden"][selected_idx])
+                score += homogeneity_score(adata_copy.obs[key][selected_idx], adata_copy.obs["leiden"][selected_idx])
+            score /= len(self.covariate_keys)
+            return score
 
-    def n_component_assignment(self, x, min_components):
-        n_all_components = int(x["n_all_components"])
-
-        n_component_ratio = [x[f'components_ratio_{i}'] for i in range(len(self.covariate_keys) + 1)]
-        n_component_ratio = [ratio / sum(n_component_ratio) for ratio in n_component_ratio]
-
-        n_components = int(n_all_components / 2)
-        rest_components = n_all_components - n_components
-        n_covariate_components = [int(ratio * rest_components) for ratio in n_component_ratio[1:]]
-
-        # Ensure that each covariate component is at least the minimum required
-        n_covariate_components = [max(min_components[i], n) for i, n in enumerate(n_covariate_components)]
-
-        # Adjust n_components to ensure the total sum is equal to n_all_components
-        total_covariate_components = sum(n_covariate_components)
-        n_components = n_all_components - total_covariate_components
-
-        return n_components, n_covariate_components
+        resolutions = [2 * x / n for x in range(1, n + 1)]
+        scores = Parallel(n_jobs=-1)(delayed(score_for_res)(res) for res in resolutions)
+        return min(scores)
 
 
     def objective(self, space):
         # Handle multiple covariate components separately
         lam = [space[f'lam_{i}'] for i in range(len(self.covariate_keys))]
-        n_components, n_covariate_components = self.n_component_assignment(space, self.min_components)
+        n_components = int(space['n_components'])
+        n_covariate_components = [int(space[f'n_covariate_components_{i}']) for i in range(len(self.covariate_keys))]
 
         args = {
             'n_components': n_components,
@@ -228,70 +192,35 @@ class ComponentOptimizer:
 
     def bayesian_search(
             self,
-            n_total_components_range=(50, 100),
+            n_components_range=(10, 50),
+            max_covariate_components=None,
             lam_power_range=(1, 6),
-            alpha_W_range=(0, 1),
+            alpha_W_range=(0, 100),
             orth_W_range=(0, 0.5),
             l1_ratio_range=(0, 1),
-            weight_reduce_covar_dims=0.5,
+            weight_reduce_covar_dims=0.0,
             n_splits=None,
-            max_evals=50,
-            min_components=None,
+            max_evals=100,
             trials_filename=None
         ):
-        """
-        Perform Bayesian optimization to search for the best hyperparameters.
-        This method uses Tree-structured Parzen Estimator (TPE) to optimize the 
-        hyperparameters for a model. It defines a search space, evaluates the 
-        objective function, and finds the best parameters.
-        Parameters:
-            n_total_components_range (tuple, optional): 
-                Range for the total number of components. Defaults to (50, 100).
-            lam_power_range (tuple, optional): 
-                Range for the power of lambda regularization. Defaults to (1, 6).
-            alpha_W_range (tuple, optional): 
-                Range for the alpha_W parameter. Defaults to (0, 1).
-            orth_W_range (tuple, optional): 
-                Range for the orthogonality regularization of W. Defaults to (0, 0.5).
-            l1_ratio_range (tuple, optional): 
-                Range for the L1 ratio. Defaults to (0, 1).
-            weight_reduce_covar_dims (float, optional): 
-                Weight to reduce covariance dimensions. Defaults to 0.5.
-            n_splits (int, optional): 
-                Number of splits for cross-validation. Defaults to None.
-            max_evals (int, optional): 
-                Maximum number of evaluations for the optimization. Defaults to 50.
-            min_components (int or list, optional): 
-                Minimum number of components for each covariate. If None, it is 
-                inferred from the data. Defaults to None.
-            trials_filename (str, optional): 
-                Path to a file to load/save optimization trials. Defaults to None.
-        Returns:
-            dict: A dictionary containing the best hyperparameters:
-                - 'n_components': Total number of components.
-                - 'n_covariate_components': Number of components for each covariate.
-                - 'lam': List of lambda values for each covariate.
-                - 'alpha_W': Best alpha_W value.
-                - 'orth_W': Best orth_W value.
-                - 'l1_ratio': Best L1 ratio value.
-                - 'random_state': Random state used for reproducibility.
-        Raises:
-            ValueError: If `min_components` is less than 2 or if its length does 
-                not match the number of covariates.
-        """
 
-        if min_components is None:
-            min_components = [self.adata.obs[key].nunique() for key in self.covariate_keys]
+        if max_covariate_components is None:
+            max_covariate_components = [self.adata.obs[key].nunique() * 2 for key in self.covariate_keys]
+            warnings.warn(
+                f"`max_covariate_components` was not provided. Defaulting to 2 × the number of unique values for each covariate: {max_covariate_components}. "
+                "If this does not yield optimal results, please set `max_covariate_components` manually for each covariate. "
+                "For further tuning advice, consult the documentation or visit the GitHub repository.",
+                UserWarning
+            )
         else:
-            if isinstance(min_components, list):
-                if len(min_components) != len(self.covariate_keys):
-                    raise ValueError("min_components should have the same length as the number of covariates.")
-            else:
-                min_components = [min_components] * len(self.covariate_keys)
+            if isinstance(max_covariate_components, list):
+                if len(max_covariate_components) != len(self.covariate_keys):
+                    raise ValueError("max_covariate_components should have the same length as the number of covariates.")
         
-        if any(comp < 2 for comp in min_components):
-            raise ValueError("min_components should be greater than or equal to 2.")
-        self.min_components = min_components
+        if any(comp < 2 for comp in max_covariate_components):
+            raise ValueError("max_covariate_components should be greater than or equal to 2.")
+        
+        self.max_covariate_components = max_covariate_components
         self.weight_reduce_covar_dims = weight_reduce_covar_dims
         self.iter_records = []
         self.n_splits = n_splits
@@ -304,8 +233,7 @@ class ComponentOptimizer:
 
         # Define the search space for Bayesian Optimization
         self.space = {
-            # Ensure n_components is at least 50% of n_total_components
-            'n_all_components': hp.quniform('n_all_components', n_total_components_range[0], n_total_components_range[1], 1),
+            'n_components': hp.quniform('n_components', n_components_range[0], n_components_range[1], 1),
             'alpha_W': hp.uniform('alpha_W', alpha_W_range[0], alpha_W_range[1]),
             'orth_W': hp.uniform('orth_W', orth_W_range[0], orth_W_range[1]),
             'l1_ratio': hp.uniform('l1_ratio', l1_ratio_range[0], l1_ratio_range[1])
@@ -314,16 +242,14 @@ class ComponentOptimizer:
         # Distribute the remaining space across covariate components
         for i in range(len(self.covariate_keys)):
             self.space[f'lam_{i}'] = hp.uniform(f'lam_{i}', lam_power_range[0], lam_power_range[1])
-            # Ensure that sum of all covariates equals the remaining space
-        
-        # covariate
-        for i in range(len(self.covariate_keys) + 1):
-            self.space[f'components_ratio_{i}'] = hp.uniform(f'components_ratio_{i}', 0, 1)
+            self.space[f'n_covariate_components_{i}'] = hp.quniform(f'n_covariate_components_{i}', 1.9, max_covariate_components[i], 1)
 
         # Run the optimization using TPE
         best = fmin(self.objective, self.space, algo=tpe.suggest, max_evals=max_evals + len(self.trials.trials), trials=self.trials)
 
-        n_components, n_covariate_components = self.n_component_assignment(best, self.min_components)
+        n_components = int(best['n_components'])
+        n_covariate_components = [int(best[f'n_covariate_components_{i}']) for i in range(len(self.covariate_keys))]
+
         self.best_param['n_components'] = n_components
         self.best_param['n_covariate_components'] = n_covariate_components
         self.best_param['lam'] = [float(10**best[f'lam_{i}']) for i in range(len(self.covariate_keys))]
@@ -359,9 +285,10 @@ class ComponentOptimizer:
             trials=self.trials
         )
 
+        n_components = int(self.space['n_components'])
+        n_covariate_components = [int(self.space[f'n_covariate_components_{i}']) for i in range(len(self.covariate_keys))]
 
         # Assign the best parameters from the latest search
-        n_components, n_covariate_components = self.n_component_assignment(best, self.min_components)
         self.best_param['n_components'] = n_components
         self.best_param['n_covariate_components'] = n_covariate_components
         self.best_param['lam'] = [float(10**best[f'lam_{i}']) for i in range(len(self.covariate_keys))]
@@ -506,7 +433,7 @@ class ComponentOptimizer:
             **self.best_param,
             random_state = self.random_state,
             loss_type = self.loss_type,
-            gpu = self.gpu,
+            device = self.device,
             
         )
         model.fit(X=self.adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, batch_size=self.batch_size, verbose=False)
