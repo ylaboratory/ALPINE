@@ -190,7 +190,7 @@ class ComponentOptimizer:
         return {'loss': loss, 'status': STATUS_OK, 'params': trial_history}
     
 
-    def bayesian_search(
+    def search_hyperparams(
             self,
             n_components_range=(10, 50),
             max_covariate_components=None,
