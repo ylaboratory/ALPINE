@@ -168,26 +168,28 @@ class ComponentOptimizer:
             'l1_ratio': space['l1_ratio']
         }
 
-        score = self.calc_ari(args)
-        
-        trial_history = {
-            'n_components': n_components,
-            'n_covariate_components': n_covariate_components,
-            'lam': [10**l for l in lam],
-            'alpha_W': space['alpha_W'],
-            'orth_W': space['orth_W'],
-            'l1_ratio': space['l1_ratio'],
-            'max_iter': self.iter_records[-1] if self.max_iter_detect else self.max_iter,
-            'score': score
-        }
-        
-        if self.max_iter_detect:
-            if len(self.iter_records) >= 5:
-                self.max_iter = max(self.iter_records)
+        n_total_covariate_components = sum(n_covariate_components)
+        if n_total_covariate_components < n_components:
 
-        n_totoal_covariate_components = sum(n_covariate_components)
-        loss = score + self.weight_reduce_covar_dims * (n_totoal_covariate_components/(n_totoal_covariate_components + n_components))
-        return {'loss': loss, 'status': STATUS_OK, 'params': trial_history}
+            score = self.calc_ari(args)
+            trial_history = {
+                'n_components': n_components,
+                'n_covariate_components': n_covariate_components,
+                'lam': [10**l for l in lam],
+                'alpha_W': space['alpha_W'],
+                'orth_W': space['orth_W'],
+                'l1_ratio': space['l1_ratio'],
+                'max_iter': self.iter_records[-1] if self.max_iter_detect else self.max_iter,
+                'score': score
+            }
+            
+            if self.max_iter_detect:
+                if len(self.iter_records) >= 5:
+                    self.max_iter = max(self.iter_records)
+
+            return {'loss': score, 'status': STATUS_OK, 'params': trial_history}
+        else:
+            return {'loss': np.inf, 'status': STATUS_FAIL}
     
 
     def search_hyperparams(
@@ -198,7 +200,6 @@ class ComponentOptimizer:
             alpha_W_range=(0, 100),
             orth_W_range=(0, 0.5),
             l1_ratio_range=(0, 1),
-            weight_reduce_covar_dims=0.0,
             n_splits=None,
             max_evals=100,
             trials_filename=None
@@ -221,7 +222,6 @@ class ComponentOptimizer:
             raise ValueError("max_covariate_components should be greater than or equal to 2.")
         
         self.max_covariate_components = max_covariate_components
-        self.weight_reduce_covar_dims = weight_reduce_covar_dims
         self.iter_records = []
         self.n_splits = n_splits
 

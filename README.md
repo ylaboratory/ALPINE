@@ -18,6 +18,7 @@ The ALPINE preprint is now available; please review the article at [link](https:
 > 1. The `get_normalized_expression` function now saves the normalized counts in `adata.layers["normalized_expression"]` instead of `adata.obsm["normalized_expression"]`.
 > 2. The `bayesian_search` method in the `ComponentOptimizer` class has been renamed to `search_hyperparams`.
 > 3. The `gpu` argument in both `ALPINE` and `ComponentOptimizer` has been replaced with a `device` argument. Users can now manually specify the device to use (e.g., `"cpu"`, `"cuda"`, or `"mps"`). macOS users with Apple Silicon can try `"mps"` to leverage the GPU on M-series chips.
+> 4. In `ComponentOptimizer`, the previous design required specifying only the total number of components, and the optimizer would automatically allocate components to each part. In the new version, users must define both `n_components_range` and `max_covariate_components`. This change was made because the original approach was less effective at identifying the optimal number of components.
 
 **Contents**:
 
@@ -72,8 +73,9 @@ from alpine import ComponentOptimizer
 co = ComponentOptimizer(adata, covariate_keys=["cov_1", "cov_2"])
 
 # start searching with given parameter range
-params = co.bayesian_search(
-    n_total_components_range=(50, 100), 
+params = co.search_hyperparams(
+    n_components_range=(10, 50),
+    max_covariate_components=[10, 10, 10] 
     alpha_W_range=(0, 1),
     orth_W_range=(0, 0.5),
     l1_ratio_range=(0, 1),
@@ -81,7 +83,8 @@ params = co.bayesian_search(
 ```
 
 - `covariate_keys` specifies the categorical columns in `adata.obs` that will be used as covariates.
-- `n_total_components_range` sets the range for the total number of components, including `n_components` for unguided embeddings and `n_covariate_components` for guided embeddings.
+- `n_components_range` sets the range for the number of components for the unguided part.
+- `max_covariate_components` specifies the maximum number of components allocated to each guided (covariate) part. The optimizer will search for the optimal number of components within the range from 2 up to the maximum value you provide for each covariate.
 - `lam_power_range` defines the range for lambda values, spanning from \(10^1\) to \(10^5\).
 - `orth_W_range`: The range for the orthogonal weight regularization on the \( W \) matrix, designed to encourage gene signatures to capture distinct patterns.
 - `l1_ratio_range`: The range for the L1 ratio, controlling the balance between L1 (LASSO) and L2 (ridge) regularization.
@@ -105,7 +108,7 @@ alpine_model = ALPINE(
     n_covariate_components = [5, 5] 
     alpha_W = 0,
     lam = [1e+3, 1e+3],
-    gpu = True
+    device = "cuda"
 )
 alpine_model.fit(adata, covariate_keys=["cov_1", "cov_2"])
 ```
@@ -151,7 +154,7 @@ To obtain the normalized counts that are free from batch effects and conditions,
 alpine_model.get_normalized_expression(adata)
 
 # the normalized counts is in here
-adata.obsm["normalized_expression"]
+adata.layers["normalized_expression"]
 ```
 
 There are additional applications for our model; please refer to the next section for more details.
