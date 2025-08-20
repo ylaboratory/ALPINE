@@ -12,26 +12,27 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import silhouette_score
 from scipy.spatial.distance import pdist, squareform
 from joblib import Parallel, delayed
-import warnings
 
 class ComponentOptimizer:
-    
+
     def __init__(
             self,
             adata,
             covariate_keys,
             loss_type='kl-divergence',
+            use_sample_weights=True,
             max_iter=None,
             batch_size=None,
-            device="cuda",
+            gpu=True,
             random_state=None
         ):
         self.adata = adata.copy()
         self.covariate_keys = covariate_keys
         self.loss_type = loss_type
+        self.use_sample_weights = use_sample_weights
         self.max_iter = max_iter
         self.random_state = random_state
-        self.device = device
+        self.gpu = gpu
         self.batch_size = batch_size
         self.best_param = {}
         self.minimum_set_param = {}
@@ -77,26 +78,24 @@ class ComponentOptimizer:
                     l1_ratio=l1_ratio,
                     random_state=self.random_state,
                     loss_type=self.loss_type,
-                    device=self.device,
+                    gpu=self.gpu,
                 )
-                
-                model.fit(X=train_adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, batch_size=self.batch_size, verbose=False)
+
+                model.fit(X=train_adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, use_sample_weights=self.use_sample_weights, batch_size=self.batch_size, verbose=False)
                 model.store_embeddings(train_adata)
                 _ = model.transform(val_adata, use_label=False)
 
+                # embedding score
                 sc.pp.neighbors(val_adata, use_rep='ALPINE_embedding')
-                # scores.append(self.calc_ARI_score(val_adata))
-
-                sc.tl.leiden(val_adata, flavor="igraph", resolution=5)
-                score = 0
+                sc.tl.leiden(val_adata, flavor="igraph", resolution=1)
+                embedding_score = 0
                 for key in self.covariate_keys:
                     selected_idx = ~val_adata.obs[key].isna()
-                    score += adjusted_rand_score(val_adata.obs[key][selected_idx], val_adata.obs["leiden"][selected_idx])
-                    score += homogeneity_score(val_adata.obs[key][selected_idx], val_adata.obs["leiden"][selected_idx])
-                score /= len(self.covariate_keys)
+                    embedding_score += adjusted_rand_score(val_adata.obs[key][selected_idx], val_adata.obs["leiden"][selected_idx])
+                    embedding_score += homogeneity_score(val_adata.obs[key][selected_idx], val_adata.obs["leiden"][selected_idx])
+                embedding_score /= len(self.covariate_keys)
 
-                scores.append(score)
-
+                scores.append(embedding_score)
 
                 if self.max_iter_detect:
                     self.iter_records.append(model.max_iter)
@@ -113,51 +112,54 @@ class ComponentOptimizer:
                 l1_ratio=l1_ratio,
                 random_state=self.random_state,
                 loss_type=self.loss_type,
-                device=self.device,
+                gpu=self.gpu,
             )
 
             adata = self.adata.copy()
-            model.fit(X=adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, batch_size=self.batch_size, verbose=False)
+            model.fit(X=adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, use_sample_weights=self.use_sample_weights, batch_size=self.batch_size, verbose=False)
             model.store_embeddings(adata)
 
             sc.pp.neighbors(adata, use_rep='ALPINE_embedding')
-            # score = self.calc_ARI_score(adata)
             sc.tl.leiden(adata, flavor="igraph", resolution=1)
-            score = 0
+            embedding_score = 0
             for key in self.covariate_keys:
                 selected_idx = ~adata.obs[key].isna()
-                score += adjusted_rand_score(adata.obs[key][selected_idx], adata.obs["leiden"][selected_idx])
-                score += homogeneity_score(adata.obs[key][selected_idx], adata.obs["leiden"][selected_idx])
-            score /= len(self.covariate_keys)
-        
+                embedding_score += adjusted_rand_score(adata.obs[key][selected_idx], adata.obs["leiden"][selected_idx])
+                embedding_score += homogeneity_score(adata.obs[key][selected_idx], adata.obs["leiden"][selected_idx])
+            embedding_score /= len(self.covariate_keys)
+
+            score = embedding_score
+
             if self.max_iter_detect:
                 self.iter_records.append(model.max_iter)
 
         return score
 
-    def calc_ARI_score(self, adata, n=10):
+    def n_component_assignment(self, x, min_covariate_components):
+        n_all_components = int(x["n_all_components"])
 
-        def score_for_res(res):
-            adata_copy = adata.copy()
-            sc.tl.leiden(adata_copy, flavor="igraph", resolution=res)
-            score = 0
-            for key in self.covariate_keys:
-                selected_idx = ~adata_copy.obs[key].isna()
-                score += adjusted_rand_score(adata_copy.obs[key][selected_idx], adata_copy.obs["leiden"][selected_idx])
-                score += homogeneity_score(adata_copy.obs[key][selected_idx], adata_copy.obs["leiden"][selected_idx])
-            score /= len(self.covariate_keys)
-            return score
+        n_component_ratio = [x[f'components_ratio_{i}'] for i in range(len(self.covariate_keys) + 1)]
+        n_component_ratio = [ratio / sum(n_component_ratio) for ratio in n_component_ratio]
 
-        resolutions = [2 * x / n for x in range(1, n + 1)]
-        scores = Parallel(n_jobs=-1)(delayed(score_for_res)(res) for res in resolutions)
-        return min(scores)
+        n_components = int(n_all_components / 2)
+        rest_components = n_all_components - n_components
+        n_covariate_components = [int(ratio * rest_components) for ratio in n_component_ratio[1:]]
+
+        # Ensure that each covariate component is at least the minimum required
+        n_covariate_components = [max(min_covariate_components[i], n) for i, n in enumerate(n_covariate_components)]
+
+        # Adjust n_components to ensure the total sum is equal to n_all_components
+        total_covariate_components = sum(n_covariate_components)
+
+        n_components = n_all_components - total_covariate_components
+
+        return n_components, n_covariate_components
 
 
     def objective(self, space):
         # Handle multiple covariate components separately
         lam = [space[f'lam_{i}'] for i in range(len(self.covariate_keys))]
-        n_components = int(space['n_components'])
-        n_covariate_components = [int(space[f'n_covariate_components_{i}']) for i in range(len(self.covariate_keys))]
+        n_components, n_covariate_components = self.n_component_assignment(space, self.min_covariate_components)
 
         args = {
             'n_components': n_components,
@@ -168,60 +170,54 @@ class ComponentOptimizer:
             'l1_ratio': space['l1_ratio']
         }
 
-        n_total_covariate_components = sum(n_covariate_components)
-        if n_total_covariate_components < n_components:
+        score = self.calc_ari(args)
+        
+        trial_history = {
+            'n_components': n_components,
+            'n_covariate_components': n_covariate_components,
+            'lam': [10**l for l in lam],
+            'alpha_W': space['alpha_W'],
+            'orth_W': space['orth_W'],
+            'l1_ratio': space['l1_ratio'],
+            'max_iter': self.iter_records[-1] if self.max_iter_detect else self.max_iter,
+            'score': score
+        }
+        
+        if self.max_iter_detect:
+            if len(self.iter_records) >= 5:
+                self.max_iter = max(self.iter_records)
 
-            score = self.calc_ari(args)
-            trial_history = {
-                'n_components': n_components,
-                'n_covariate_components': n_covariate_components,
-                'lam': [10**l for l in lam],
-                'alpha_W': space['alpha_W'],
-                'orth_W': space['orth_W'],
-                'l1_ratio': space['l1_ratio'],
-                'max_iter': self.iter_records[-1] if self.max_iter_detect else self.max_iter,
-                'score': score
-            }
-            
-            if self.max_iter_detect:
-                if len(self.iter_records) >= 5:
-                    self.max_iter = max(self.iter_records)
-
-            return {'loss': score, 'status': STATUS_OK, 'params': trial_history}
-        else:
-            return {'loss': np.inf, 'status': STATUS_FAIL}
+        n_totoal_covariate_components = sum(n_covariate_components)
+        loss = score
+        return {'loss': loss, 'status': STATUS_OK, 'params': trial_history}
     
 
     def search_hyperparams(
             self,
-            n_components_range=(10, 50),
-            max_covariate_components=None,
+            n_total_components_range=(10, 100),
             lam_power_range=(1, 6),
             alpha_W_range=(0, 100),
             orth_W_range=(0, 0.5),
             l1_ratio_range=(0, 1),
             n_splits=None,
             max_evals=100,
+            min_covariate_components=None,
             trials_filename=None
         ):
 
-        if max_covariate_components is None:
-            max_covariate_components = [self.adata.obs[key].nunique() * 2 for key in self.covariate_keys]
-            warnings.warn(
-                f"`max_covariate_components` was not provided. Defaulting to 2 × the number of unique values for each covariate: {max_covariate_components}. "
-                "If this does not yield optimal results, please set `max_covariate_components` manually for each covariate. "
-                "For further tuning advice, consult the documentation or visit the GitHub repository.",
-                UserWarning
-            )
+        if min_covariate_components is None:
+            # min_covariate_components = [self.adata.obs[key].nunique() for key in self.covariate_keys]
+            min_covariate_components = [2 for _ in self.covariate_keys]
         else:
-            if isinstance(max_covariate_components, list):
-                if len(max_covariate_components) != len(self.covariate_keys):
-                    raise ValueError("max_covariate_components should have the same length as the number of covariates.")
+            if isinstance(min_covariate_components, list):
+                if len(min_covariate_components) != len(self.covariate_keys):
+                    raise ValueError("min_covariate_components should have the same length as the number of covariates.")
+            else:
+                min_covariate_components = [min_covariate_components] * len(self.covariate_keys)
         
-        if any(comp < 2 for comp in max_covariate_components):
-            raise ValueError("max_covariate_components should be greater than or equal to 2.")
-        
-        self.max_covariate_components = max_covariate_components
+        if any(comp < 2 for comp in min_covariate_components):
+            raise ValueError("min_covariate_components should be greater than or equal to 2.")
+        self.min_covariate_components = min_covariate_components
         self.iter_records = []
         self.n_splits = n_splits
 
@@ -233,7 +229,8 @@ class ComponentOptimizer:
 
         # Define the search space for Bayesian Optimization
         self.space = {
-            'n_components': hp.quniform('n_components', n_components_range[0], n_components_range[1], 1),
+            # Ensure n_components is at least 50% of n_total_components
+            'n_all_components': hp.quniform('n_all_components', n_total_components_range[0], n_total_components_range[1], 1),
             'alpha_W': hp.uniform('alpha_W', alpha_W_range[0], alpha_W_range[1]),
             'orth_W': hp.uniform('orth_W', orth_W_range[0], orth_W_range[1]),
             'l1_ratio': hp.uniform('l1_ratio', l1_ratio_range[0], l1_ratio_range[1])
@@ -242,14 +239,16 @@ class ComponentOptimizer:
         # Distribute the remaining space across covariate components
         for i in range(len(self.covariate_keys)):
             self.space[f'lam_{i}'] = hp.uniform(f'lam_{i}', lam_power_range[0], lam_power_range[1])
-            self.space[f'n_covariate_components_{i}'] = hp.quniform(f'n_covariate_components_{i}', 1.9, max_covariate_components[i], 1)
+            # Ensure that sum of all covariates equals the remaining space
+        
+        # covariate
+        for i in range(len(self.covariate_keys) + 1):
+            self.space[f'components_ratio_{i}'] = hp.uniform(f'components_ratio_{i}', 0, 1)
 
         # Run the optimization using TPE
         best = fmin(self.objective, self.space, algo=tpe.suggest, max_evals=max_evals + len(self.trials.trials), trials=self.trials)
 
-        n_components = int(best['n_components'])
-        n_covariate_components = [int(best[f'n_covariate_components_{i}']) for i in range(len(self.covariate_keys))]
-
+        n_components, n_covariate_components = self.n_component_assignment(best, self.min_covariate_components)
         self.best_param['n_components'] = n_components
         self.best_param['n_covariate_components'] = n_covariate_components
         self.best_param['lam'] = [float(10**best[f'lam_{i}']) for i in range(len(self.covariate_keys))]
@@ -262,17 +261,7 @@ class ComponentOptimizer:
 
 
     def extend_training(self, extra_evals=50):
-        """
-        Continue the Bayesian optimization process with more evaluations.
-
-        Parameters:
-            extra_evals: int
-                The number of additional evaluations to perform during the Bayesian search.
-
-        Returns:
-            dict
-                The updated best parameters after the additional evaluations.
-        """
+        
         if not hasattr(self, 'trials'):
             raise RuntimeError("Please run bayesian_search() before extending training.")
         
@@ -285,10 +274,9 @@ class ComponentOptimizer:
             trials=self.trials
         )
 
-        n_components = int(self.space['n_components'])
-        n_covariate_components = [int(self.space[f'n_covariate_components_{i}']) for i in range(len(self.covariate_keys))]
 
         # Assign the best parameters from the latest search
+        n_components, n_covariate_components = self.n_component_assignment(best, self.min_covariate_components)
         self.best_param['n_components'] = n_components
         self.best_param['n_covariate_components'] = n_covariate_components
         self.best_param['lam'] = [float(10**best[f'lam_{i}']) for i in range(len(self.covariate_keys))]
@@ -302,45 +290,21 @@ class ComponentOptimizer:
 
 
     def save_trials (self, filename: str):
-        """
-        Save the current trials to a file.
         
-        Parameters:
-            filename: str
-                Path to the file where the trials will be saved.
-        """
         with open(filename, 'wb') as f:
             pickle.dump(self.trials, f)
         print(f"Trials saved to {filename}")
 
 
     def load_trials (self, filename: str):
-        """
-        Load the trials from a file.
         
-        Parameters:
-            filename: str
-                Path to the file from which to load the trials.
-        """
         with open(filename, 'rb') as f:
             self.trials = pickle.load(f)
         print(f"Trials loaded from {filename}")
 
 
     def get_hyperparameter(self, idx):
-        """
-        Retrieve the hyperparameters of a specific trial based on its index in the sorted training history.
-        Args:
-            idx (int): The index of the trial in the sorted training history.
-        Returns:
-            dict: A dictionary containing the hyperparameters of the specified trial.
-        Raises:
-            IndexError: If the provided index is out of bounds for the training history.
-            KeyError: If the expected keys ('tid' or 'params') are missing in the trial data.
-        Notes:
-            - The training history is assumed to be sorted prior to fetching the trial.
-            - The method matches the trial in `self.trials` using the trial ID ('tid') from the history.
-        """
+        
         # Fetch the sorted trial history
         history_df = self.get_train_history()
 
@@ -356,28 +320,7 @@ class ComponentOptimizer:
                 return trial['result']['params']
 
     def get_train_history(self):
-        """
-        Retrieves and processes the training history from the optimization trials.
-
-        This method extracts trial information, processes it into a structured format,
-        and returns a pandas DataFrame containing details about each trial, including
-        the parameters, scores, and derived metrics.
-
-        Returns:
-            pd.DataFrame: A DataFrame containing the following columns:
-                - n_components: The number of components used in the trial.
-                - n_covariate_components_X: Expanded columns for each covariate component (X is the index).
-                - n_total_components: The total number of components, calculated as the sum of 
-                  `n_components` and all `n_covariate_components`.
-                - score: The score (loss) of the trial.
-                - tid: The trial ID for tracking.
-                - Other columns corresponding to the trial parameters.
-
-        Notes:
-            - The DataFrame is sorted by the `score` column in descending order.
-            - The index of the DataFrame is reset after sorting.
-            - The columns are reordered to place `n_components` and related columns at the beginning.
-        """
+        
         history = []
 
         # Extract trial information
@@ -415,16 +358,6 @@ class ComponentOptimizer:
 
 
     def fit_the_best_param(self):
-        """
-        Fits the ALPINE model using the best parameters found through Bayesian search.
-        This method initializes an ALPINE model with the best parameters stored in `self.best_param`
-        and fits it using the provided data and configuration.
-        Returns:
-            ALPINE: An instance of the ALPINE model fitted with the best parameters.
-        Raises:
-            RuntimeError: If the `best_param` attribute is not set. Ensure that `bayesian_search()` 
-                          is run prior to calling this method to determine the best parameters.
-        """
 
         if not hasattr(self, 'best_param'):
             raise RuntimeError("Please run bayesian_search() to find the best parameters first.")
@@ -433,8 +366,8 @@ class ComponentOptimizer:
             **self.best_param,
             random_state = self.random_state,
             loss_type = self.loss_type,
-            device = self.device,
+            gpu = self.gpu,
             
         )
-        model.fit(X=self.adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, batch_size=self.batch_size, verbose=False)
+        model.fit(X=self.adata, covariate_keys=self.covariate_keys, max_iter=self.max_iter, use_sample_weights=self.use_sample_weights, batch_size=self.batch_size, verbose=False)
         return model
