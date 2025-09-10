@@ -18,7 +18,6 @@ The ALPINE preprint is now available; please review the article at [link](https:
 > 1. The `get_normalized_expression` function now saves the normalized counts in `adata.layers["normalized_expression"]` instead of `adata.obsm["normalized_expression"]`.
 > 2. The `bayesian_search` method in the `ComponentOptimizer` class has been renamed to `search_hyperparams`.
 > 3. The `gpu` argument in both `ALPINE` and `ComponentOptimizer` has been replaced with a `device` argument. Users can now manually specify the device to use (e.g., `"cpu"`, `"cuda"`, or `"mps"`). macOS users with Apple Silicon can try `"mps"` to leverage the GPU on M-series chips.
-> 4. In `ComponentOptimizer`, the previous design required specifying only the total number of components, and the optimizer would automatically allocate components to each part. In the new version, users must define both `n_components_range` and `max_covariate_components`. This change was made because the original approach was less effective at identifying the optimal number of components.
 
 **Contents**:
 
