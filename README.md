@@ -74,8 +74,7 @@ co = ComponentOptimizer(adata, covariate_keys=["cov_1", "cov_2"])
 
 # start searching with given parameter range
 params = co.search_hyperparams(
-    n_components_range=(10, 50),
-    max_covariate_components=[10, 10, 10] 
+    n_total_components_range=(50, 100), 
     alpha_W_range=(0, 1),
     orth_W_range=(0, 0.5),
     l1_ratio_range=(0, 1),
@@ -83,8 +82,7 @@ params = co.search_hyperparams(
 ```
 
 - `covariate_keys` specifies the categorical columns in `adata.obs` that will be used as covariates.
-- `n_components_range` sets the range for the number of components for the unguided part.
-- `max_covariate_components` specifies the maximum number of components allocated to each guided (covariate) part. The optimizer will search for the optimal number of components within the range from 2 up to the maximum value you provide for each covariate.
+- `n_total_components_range` sets the range for the total number of components, including `n_components` for unguided embeddings and `n_covariate_components` for guided embeddings.
 - `lam_power_range` defines the range for lambda values, spanning from \(10^1\) to \(10^5\).
 - `orth_W_range`: The range for the orthogonal weight regularization on the \( W \) matrix, designed to encourage gene signatures to capture distinct patterns.
 - `l1_ratio_range`: The range for the L1 ratio, controlling the balance between L1 (LASSO) and L2 (ridge) regularization.
