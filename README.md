@@ -29,6 +29,7 @@ The ALPINE preprint is now available; please review the article at [link](https:
     - [2. Multi-condition disentangle using ALPINE](#2-multi-condition-disentangle-using-alpine)
       - [a. Training the model](#a-training-the-model)
       - [b. Get the decomposed matrices and counts](#b-get-the-decomposed-matrices-and-counts)
+  - [Easy transfer to Seurat object](#easy-transfer-to-seurat-object)
   - [More usage, and analysis](#more-usage-and-analysis)
   - [Citation](#citation)
 
@@ -158,6 +159,53 @@ adata.layers["normalized_expression"]
 ```
 
 There are additional applications for our model; please refer to the next section for more details.
+
+## Easy transfer to Seurat object
+
+In Python, we usually store the `anndata` into `h5ad` format. To easily transfer the `h5ad` to Seurat object, this requires three packages installed in R. If want to check the full tutorial, please visit our tutorial repo [here](https://github.com/ylaboratory/ALPINE-analysis/blob/master/tutorials/transfer_from_anndata_to_seurat.Rmd).
+
+```R
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install(c("zellkonverter", "SingleCellExperiment", "Seurat"))
+```
+
+Then we can load the `h5ad` format through the following commands, and we could quickly examine through the data is intact.
+
+```R
+adata <- readH5AD("your_file.h5ad")
+
+# check the adata
+assayNames(adata)   # e.g. "X", "counts", "normalized_expression"
+reducedDimNames(adata) # e.g. guided and unguided embeddings: "ALPINE_embedding", "batch", "condition"
+colnames(colData(adata)) # cell metadata
+rownames(rowData(adata)) # gene metadata
+```
+
+Then we can create the Seurat Object, and move the ALPINE embeddings and gene signatures into the object.
+
+```R
+# createt Seurat object
+raw_counts <- assays(adata)[["counts"]]  # or "X" if that's your raw
+seurat_obj <- CreateSeuratObject(counts = raw_counts, project = "ALPINE_demo")
+
+# store the ALPINE counts
+ALPINE_counts <- assays(adata)[["normalized_expression"]]
+seurat_obj[["normalized_expression"]] <- CreateAssayObject(counts = ALPINE_counts)
+
+# add cell metadata
+cell_metadata <- as.data.frame(colData(adata))
+seurat_obj <- AddMetaData(seurat_obj, metadata = cell_metadata)
+
+# add the ALPINE embeddings and weights
+gene_loadings <- adata@rowRanges@elementMetadata@listData$varm@listData$ALPINE_weights
+seurat_obj[["ALPINE"]] <- CreateDimReducObject(
+    embeddings = reducedDims(adata)$ALPINE_embedding,
+    loadings = gene_loadings,
+    key = "ALPINE_",
+    assay = DefaultAssay(seurat_obj)
+)
+```
 
 ## More usage, and analysis
 

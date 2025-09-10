@@ -1,8 +1,6 @@
 alpine/_optimization.py
 alpine/_main.py
 alpine/main_refactor.py
-alpine/encoder.py
-alpine/utils
 alpine/optimization_refactor.py
 alpine/legacy/
 alpine/refactor
@@ -12,3 +10,5 @@ uv.lock
 .venv
 alpine/__pycache__/
 alpine/.mypy_cache/
+
+__pycache__
