@@ -244,7 +244,7 @@ class ALPINE:
         else:
             return self.matrices
 
-    def get_conditional_gene_scores(
+    def get_gene_scores(
             self,
             adata: Optional[ad.AnnData] = None,
         ) -> Union[Dict[str, pd.DataFrame], None]:
@@ -252,7 +252,7 @@ class ALPINE:
         if not hasattr(self, "matrices"):
             raise RuntimeError("Model is not trained yet. Please fit the model first.")
 
-        cond_gene_scores = {}
+        cov_gene_scores = {}
         for i, covariate in enumerate(self.covariate_keys):
             W = self.matrices["Ws"][i]
             H = self.matrices["Hs"][i]
@@ -262,14 +262,14 @@ class ALPINE:
             cond_genes = W @ HY
 
             colnames = self.fe.encoded_labels[covariate]
-            cond_gene_scores[covariate] = pd.DataFrame(
+            cov_gene_scores[covariate] = pd.DataFrame(
                 cond_genes, index=self.feature_names, columns=colnames
             )
 
         if adata is None:
-            return cond_gene_scores
+            return cov_gene_scores
         else:
-            for condition, df in cond_gene_scores.items():
+            for condition, df in cov_gene_scores.items():
                 adata.varm[condition + "_gene_scores"] = df
             return None
 
