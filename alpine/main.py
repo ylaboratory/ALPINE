@@ -247,18 +247,10 @@ class ALPINE:
     def get_conditional_gene_scores(
             self,
             adata: Optional[ad.AnnData] = None,
-            percentile: Optional[float] = None
         ) -> Union[Dict[str, pd.DataFrame], None]:
         
         if not hasattr(self, "matrices"):
             raise RuntimeError("Model is not trained yet. Please fit the model first.")
-
-        if percentile is None:
-            threshold = 0
-        else:
-            if not (0 <= percentile <= 100):
-                raise ValueError("percentile must be between 0 and 100.")
-            threshold = norm.ppf(percentile / 100)
 
         cond_gene_scores = {}
         for i, covariate in enumerate(self.covariate_keys):
@@ -267,22 +259,7 @@ class ALPINE:
             Y = self.matrices["Ys"][i]
 
             HY = H @ Y.T / Y.sum(axis=1)
-
-            # z-score on flattened HY
-            flat = HY.ravel()
-            zscores = zscore(flat)
-
-            # significance mask
-            significant_mask = np.abs(zscores) >= threshold
-
-            # map back to row/col indices
-            sig_rows, _ = np.where(significant_mask.reshape(HY.shape))
-            signatures = np.unique(sig_rows)
-
-            W_sig = W[:, signatures]
-            H_sig = H[signatures, :]
-
-            cond_genes = W_sig @ H_sig @ Y.T
+            cond_genes = W @ HY
 
             colnames = self.fe.encoded_labels[covariate]
             cond_gene_scores[covariate] = pd.DataFrame(
