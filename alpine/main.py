@@ -244,7 +244,7 @@ class ALPINE:
         else:
             return self.matrices
 
-    def get_gene_scores(
+    def get_covariate_gene_scores(
             self,
             adata: Optional[ad.AnnData] = None,
         ) -> Union[Dict[str, pd.DataFrame], None]:
