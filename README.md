@@ -17,7 +17,8 @@ The ALPINE preprint is now available; please review the article at [link](https:
 > [!NOTE]
 > 1. The `get_normalized_expression` function now saves the normalized counts in `adata.layers["normalized_expression"]` instead of `adata.obsm["normalized_expression"]`.
 > 2. The `bayesian_search` method in the `ComponentOptimizer` class has been renamed to `search_hyperparams`.
-> 3. The `gpu` argument in both `ALPINE` and `ComponentOptimizer` has been replaced with a `device` argument. Users can now manually specify the device to use (e.g., `"cpu"`, `"cuda"`, or `"mps"`). macOS users with Apple Silicon can try `"mps"` to leverage the GPU on M-series chips.
+> 3. Rename the `get_conditional_gene_scores()` to `get_covariate_gene_scores()` and it also supports the anndata as input then automatically save into the given anndata.
+> 4. The `gpu` argument in both `ALPINE` and `ComponentOptimizer` has been replaced with a `device` argument. Users can now manually specify the device to use (e.g., `"cpu"`, `"cuda"`, or `"mps"`). macOS users with Apple Silicon can try `"mps"` to leverage the GPU on M-series chips.
 
 **Contents**:
 
