@@ -1,0 +1,14 @@
+alpine/_optimization.py
+alpine/_main.py
+alpine/main_refactor.py
+alpine/optimization_refactor.py
+alpine/legacy/
+alpine/refactor
+uv.lock
+
+.ruff_cache
+.venv
+alpine/__pycache__/
+alpine/.mypy_cache/
+
+__pycache__

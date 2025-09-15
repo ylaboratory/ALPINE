@@ -1,3 +1,5 @@
+<img src="assests/alpine_icon.png" alt="ALPINE icon" width="200" height="200"/>
+
 # ALPINE
 
 **ALPINE: Adaptive Layering of Phenotypic and Integrative Noise Extraction**
@@ -11,6 +13,25 @@ ALPINE can be useful for:
 - Removing batch effects from the data.
 
 The ALPINE preprint is now available; please review the article at [link](https://www.biorxiv.org/content/10.1101/2025.02.15.638471v1).
+
+> [!NOTE]
+> 1. The `get_normalized_expression` function now saves the normalized counts in `adata.layers["normalized_expression"]` instead of `adata.obsm["normalized_expression"]`.
+> 2. The `bayesian_search` method in the `ComponentOptimizer` class has been renamed to `search_hyperparams`.
+> 3. Rename the `get_conditional_gene_scores()` to `get_covariate_gene_scores()` and it also supports the anndata as input then automatically save into the given anndata.
+> 4. The `gpu` argument in both `ALPINE` and `ComponentOptimizer` has been replaced with a `device` argument. Users can now manually specify the device to use (e.g., `"cpu"`, `"cuda"`, or `"mps"`). macOS users with Apple Silicon can try `"mps"` to leverage the GPU on M-series chips.
+
+**Contents**:
+
+- [ALPINE](#alpine)
+  - [Installation](#installation)
+  - [Usage](#usage)
+    - [1. Optimization](#1-optimization)
+    - [2. Multi-condition disentangle using ALPINE](#2-multi-condition-disentangle-using-alpine)
+      - [a. Training the model](#a-training-the-model)
+      - [b. Get the decomposed matrices and counts](#b-get-the-decomposed-matrices-and-counts)
+  - [Easy transfer to Seurat object](#easy-transfer-to-seurat-object)
+  - [More usage, and analysis](#more-usage-and-analysis)
+  - [Citation](#citation)
 
 ## Installation
 
@@ -53,7 +74,7 @@ from alpine import ComponentOptimizer
 co = ComponentOptimizer(adata, covariate_keys=["cov_1", "cov_2"])
 
 # start searching with given parameter range
-params = co.bayesian_search(
+params = co.search_hyperparams(
     n_total_components_range=(50, 100), 
     alpha_W_range=(0, 1),
     orth_W_range=(0, 0.5),
@@ -86,7 +107,7 @@ alpine_model = ALPINE(
     n_covariate_components = [5, 5] 
     alpha_W = 0,
     lam = [1e+3, 1e+3],
-    gpu = True
+    device = "cuda"
 )
 alpine_model.fit(adata, covariate_keys=["cov_1", "cov_2"])
 ```
@@ -132,21 +153,72 @@ To obtain the normalized counts that are free from batch effects and conditions,
 alpine_model.get_normalized_expression(adata)
 
 # the normalized counts is in here
-adata.obsm["normalized_expression"]
+adata.layers["normalized_expression"]
 ```
 
 There are additional applications for our model; please refer to the next section for more details.
+
+## Easy transfer to Seurat object
+
+In Python, we usually store the `anndata` into `h5ad` format. To easily transfer the `h5ad` to Seurat object, this requires three packages installed in R. If want to check the full tutorial, please visit our tutorial repo [here](https://github.com/ylaboratory/ALPINE-analysis/blob/master/tutorials/transfer_from_anndata_to_seurat.Rmd).
+
+```R
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install(c("zellkonverter", "SingleCellExperiment", "Seurat"))
+```
+
+Then we can load the `h5ad` format through the following commands, and we could quickly examine through the data is intact.
+
+```R
+adata <- readH5AD("your_file.h5ad")
+
+# check the adata
+assayNames(adata)   # e.g. "X", "counts", "normalized_expression"
+reducedDimNames(adata) # e.g. guided and unguided embeddings: "ALPINE_embedding", "batch", "condition"
+colnames(colData(adata)) # cell metadata
+rownames(rowData(adata)) # gene metadata
+```
+
+Then we can create the Seurat Object, and move the ALPINE embeddings and gene signatures into the object.
+
+```R
+# createt Seurat object
+raw_counts <- assays(adata)[["counts"]]  # or "X" if that's your raw
+seurat_obj <- CreateSeuratObject(counts = raw_counts, project = "ALPINE_demo")
+
+# store the ALPINE counts
+ALPINE_counts <- assays(adata)[["normalized_expression"]]
+seurat_obj[["normalized_expression"]] <- CreateAssayObject(counts = ALPINE_counts)
+
+# add cell metadata
+cell_metadata <- as.data.frame(colData(adata))
+seurat_obj <- AddMetaData(seurat_obj, metadata = cell_metadata)
+
+# add the ALPINE embeddings and weights
+gene_loadings <- adata@rowRanges@elementMetadata@listData$varm@listData$ALPINE_weights
+seurat_obj[["ALPINE"]] <- CreateDimReducObject(
+    embeddings = reducedDims(adata)$ALPINE_embedding,
+    loadings = gene_loadings,
+    key = "ALPINE_",
+    assay = DefaultAssay(seurat_obj)
+)
+```
 
 ## More usage, and analysis
 
 All analyses from the papers and case studies are stored in the ALPINE-analysis repository, where you can access a variety of resources. Additionally, the repository provides valuable tips for tuning the model.
 
-- [ALPINE-anlaysis repo](https://github.com/ylaboratory/ALPINE-analysis)
-- Save, load, and extend the optimization process.
-- Retrieve condition-associated gene scores.
-- Transform new, unseen data using the trained model.
+- [ALPINE-anlaysis repository](https://github.com/ylaboratory/ALPINE-analysis) provdes following tutorials:
+  - Save, load, and extend the optimization process.
+  - Retrieve condition-associated gene scores.
+  - Transform new, unseen data using the trained model.
 
 ## Citation
 
 If you use our tool in your study, please cite the following paper:
 > Lee WH, Li L, Dannenfelser R, Yao V. Interpretable phenotype decoding from multi-condition sequencing data with ALPINE. bioRxiv. 2025:2025-02.
+
+<!-- ## Overview of ALPINE
+
+![overview](./imgs/figure1.png) -->

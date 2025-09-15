@@ -1,626 +1,1040 @@
+import gc
+import torch
+import warnings
 import numpy as np
 import pandas as pd
 import anndata as ad
 import scanpy as sc
-import torch
+import numpy.typing as npt
 
 from kneed import KneeLocator
 from tqdm import tqdm
-from typing import Optional, Union, List, Tuple
-from copy import deepcopy
-from sklearn.utils.class_weight import compute_sample_weight
+from typing import Optional, Union, List, Dict
+from copy import copy, deepcopy
 from contextlib import nullcontext
+from dataclasses import dataclass
+from .utils.encoder import FeatureEncoders
+from .utils.sampling import (
+    generate_epoch_indices,
+    get_batch_indices,
+    get_num_batches,
+    create_joint_labels_from_dummy_matrices,
+)
+
+# Define a type alias for 32-bit float arrays
+Float32Array = npt.NDArray[np.float32]
+
+
+@dataclass
+class AlpineMatrices:
+    X: torch.Tensor
+    Ys: List[torch.Tensor]
+    Ws: List[torch.Tensor]
+    Hs: List[torch.Tensor]
+    Bs: List[torch.Tensor]
+
+    def to_numpy(self) -> Dict[str, Union[Float32Array, List[Float32Array]]]:
+        return {
+            "X": self.X.cpu().numpy().astype(np.float32),
+            "Ys": [y.cpu().numpy().astype(np.float32) for y in self.Ys],
+            "Ws": [w.cpu().numpy().astype(np.float32) for w in self.Ws],
+            "Hs": [h.cpu().numpy().astype(np.float32) for h in self.Hs],
+            "Bs": [b.cpu().numpy().astype(np.float32) for b in self.Bs],
+        }
 
 
 class ALPINE:
-    
     def __init__(
         self,
-        n_covariate_components: Union[List[int], int] ,
-        n_components: int = 30,
-        alpha_W = 0,
-        orth_W = 0, 
-        l1_ratio = 0,
-        lam: Optional[Union[List[float], List[int], float, int]] = None,
-        gpu: bool = True,
+        n_components: int,
+        n_covariate_components: List[int],
+        lam: List[float],
+        orth_W: float = 0.0,
+        alpha_W: float = 0.0,
+        l1_ratio_W: float = 0.0,
+        use_als: bool = False,
         scale_needed: bool = True,
-        loss_type = 'kl-divergence',
-        random_state: Optional[int] = 42,
-        eps: float = 1e-10,
-        **kwargs
+        loss_type: str = "kl-divergence",
+        device: str = "cuda",
+        eps: float = 1e-6,
+        random_state: int = 42,
     ):
-        
-        self.n_components = n_components
-        self.n_covariate_components = [n_covariate_components] if isinstance(n_covariate_components, int) else n_covariate_components
-        self.alpha_W = alpha_W
-        self.orth_W= orth_W
-        self.l1_ratio = l1_ratio
-        self.random_state = random_state
-        self.gpu = gpu
-        self.device = torch.device("cuda" if self.gpu and torch.cuda.is_available() else "cpu")
-        self.loss_type = loss_type
-        self.eps = eps
-        self.n_all_components = self.n_covariate_components + [self.n_components]
-        self.total_components = sum(self.n_covariate_components) + self.n_components
-        self.lam = self._process_lam(lam)
-        self.scale_needed = scale_needed
-        self._check_params()
+        self.n_components: int = n_components
+        self.n_covariate_components: List[int] = n_covariate_components
+        self.lam: List[float] = lam
+        self.orth_W: float = orth_W
+        self.alpha_W: float = alpha_W
+        self.l1_ratio_W: float = l1_ratio_W
+        self.use_als: bool = use_als
+        self.scale_needed: bool = scale_needed
+        self.device: torch.device = torch.device(device)
+        self.loss_type: str = loss_type
+        self.eps: float = eps
+        self.random_state: int = random_state
 
+        # Validate initialization arguments
+        self._validate_init_args()
+
+        # other useful attributes
+        self.n_all_components = self.n_covariate_components + [self.n_components]
+        self.total_components = sum(self.n_all_components)
 
     def fit(
-            self, X: ad.AnnData, 
-            covariate_keys: Union[List[str], str], 
-            max_iter: Optional[int] = None,
-            batch_size: Optional[int] = None, 
-            sample_weights: bool = True,
-            verbose: bool = True,
-            **kwargs
-        ) -> None:
-        
-        self.max_iter = max_iter
-        self.X, self.y_input, self.condition_names = self._process_input(X, covariate_keys)
-        self.y, self.y_labels, self.M_y = zip(*[self._to_dummies(yi) for yi in self.y_input])
-        self.batch_size = batch_size if batch_size is not None else int(self.X.shape[1] / 3)
-        self._check_input()
-        
-        self.Ws = kwargs.get('Ws', None)
-        self.Hs = kwargs.get('Hs', None)
-        self.Bs = kwargs.get('Bs', None)
-        self._check_decomposed_matrices()
+        self,
+        adata: ad.AnnData,
+        covariate_keys: List[str],
+        batch_size: Optional[int] = None,
+        max_iter: Optional[int] = None,
+        sampling_method: str = "random",
+        verbose: bool = False,
+    ) -> "ALPINE":
+        # validate fit arguments and save them to class attribute
+        self._validate_fit_args(
+            adata, covariate_keys, batch_size, max_iter, sampling_method, verbose
+        )
+        self.feature_names: List[str] = adata.var_names.tolist()
+        self.n_features: int = adata.shape[1]
+        self.covariate_keys: List[str] = covariate_keys
+        self.sampling_method: str = sampling_method
+        self.verbose: bool = verbose
 
-        # Automatically search for the best max_iter if not provided
+        # copy the expression matrix
+        # owing to ALPINE takes the sample of feature by samples
+        # we do need to transport the matrix X
+        X: Float32Array = copy(adata.X).astype(np.float32).T  # type: ignore
+        n_sample = X.shape[1]
+
+        # encode the covariates
+        self.fe: FeatureEncoders = FeatureEncoders(covariate_keys)
+        Y: List[Float32Array] = self.fe.fit_transform(adata.obs)  # type: ignore
+
+        # if batch_size is none -> the batch_size = number of samples
+        self.batch_size: int = batch_size if batch_size is not None else n_sample
+
+        # if max_iter is not define, the ALPINE will run a warm-up run that to search the max_iter
+        # based on the elbow point of the reconstruction error
         if max_iter is None:
-            # for the scanning purpose
-            self.max_iter = 200
-            _, _, _ = self._fit(sample_weights, verbose=False)
-            self.max_iter = self._get_best_max_iter(self.loss_history)
-            
-            if self.max_iter == 0 or self.max_iter is None:
-                print("The max_iter detection is unable to find a good max_iter. The max_iter set to 200 as default.")
-                self.max_iter = 200
-        
-        Ws, Hs, Bs = self._fit(sample_weights, verbose)
+            # initialize a warm-up AlpineMatrices
+            m_warmup: AlpineMatrices = self._initialize_matrices(X, Y)
+            self.max_iter: int = 200
+            self._fit(m_warmup)
+            self.max_iter = self._compute_best_iter(
+                self.loss_history["reconstruction loss"].values
+            )
 
+            # release the memory used by the warm-up run
+            del m_warmup
+            gc.collect()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+        else:
+            self.max_iter: int = max_iter
+
+        # main training loop
+        # initialize other matrices
+        m: AlpineMatrices = self._initialize_matrices(X, Y)
+        self._fit(m)
+
+        # if scaling is needed
         if self.scale_needed:
-            # with np.errstate(divide='ignore', invalid='ignore'):
-            #     Bs = [_b / np.sum(_b, axis=0) for _b in Bs]
-            #     Bs = [np.where(np.isnan(_b), 0, _b) for _b in Bs]
+            self._scale_matrices(m)
 
-            for i in range(len(Ws)):
-                w_scaler = Ws[i].sum(axis=0)
-                Ws[i] /= w_scaler
-                Hs[i] *= w_scaler[:, np.newaxis]
+        # only when fit complete the function will generate matrices attributes
+        self.matrices: Dict[str, Union[Float32Array, List[Float32Array]]] = m.to_numpy()
 
-                if i < len(self.n_covariate_components):
-                    Bs[i] /= w_scaler
-
-        # Save the matrices
-        self.Ws, self.Hs, self.Bs = Ws, Hs, Bs
-        self.W = np.hstack(self.Ws)
-        self.H = np.vstack(self.Hs)
-        
+        # automatically save the embedding into anndata
+        self.store_embeddings(adata)
+        return self
 
     def transform(
-            self,
-            X: ad.AnnData,
-            n_iter: Optional[int] = None,
-            lam = None,
-            use_label = True,
-        ) -> List[np.ndarray]:
-
-        if n_iter is None:
-            n_iter = 1000
-
-        # if n_iter is None, will find a optimized n_iter
-        if use_label:
-            Hs, _ = self._transform(X, n_iter=n_iter, lam=lam)
-        else:
-            Hs, _ = self._transform_wo_labels(X, n_iter=n_iter)
-        return Hs
-
-
-    def get_decomposed_matrices(self) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
-        if not hasattr(self, 'Ws') or not hasattr(self, 'Hs') or not hasattr(self, 'Bs'):
-            raise RuntimeError("Model has not been fitted. Call fit() before get_decomposed_matrices().")
-        return deepcopy(self.Ws), deepcopy(self.Hs), deepcopy(self.Bs)
-    
-
-    def get_W_and_H(self, idx: int = -1) -> Tuple[np.ndarray, np.ndarray]:
-        if not hasattr(self, 'W') or not hasattr(self, 'H'):
-            raise RuntimeError("Model has not been fitted. Call fit() before get_W_and_H().")
-        return deepcopy(self.Ws[idx]), deepcopy(self.Hs[idx])
-
-    
-    def W_concat (self, idx: List[int]):
-        return np.concatenate([self.Ws[i] for i in idx], axis=1)
-
-
-    def H_concat (self, idx: List[int]):
-        return np.concatenate([self.Hs[i] for i in idx], axis=0)
-
-
-    def get_conditional_gene_scores (self):
-        conditional_gene_scores = []
-        for i in range(len(self.Bs)):
-            gene_scores = (self.Ws[i] @ self.Hs[i] @ self.y[i].T) / self.y[i].sum(axis=1)
-            conditional_gene_scores.append(pd.DataFrame(gene_scores, columns=self.y_labels[i]))
-        return conditional_gene_scores
-
-
-    def get_reconstructed_counts(self, idx:Optional[List[int]] = [-1]):
-        return np.sum([self.Ws[i] @ self.Hs[i] for i in idx], axis=0)
-
-    
-    def get_normalized_expression(self, adata, library_size=1e+4):
-        expression =  adata.obsm["ALPINE_embedding"] @ self.Ws[-1].T
-        exp = ad.AnnData(expression)
-        sc.pp.normalize_total(exp, target_sum=library_size)
-        adata.obsm["normalized_expression"] = exp.X
-    
-    def compute_sig_assoc(self, covariate_key: str, sample_labels: pd.Series):
-        
-        if covariate_key not in self.condition_names:
-            raise ValueError("The covariate key does not exist in the model.")
-        idx = self.condition_names.index(covariate_key)
-
-        y_df = pd.get_dummies(sample_labels, dtype=float)
-        y = y_df.values
-
-        H = self.Hs[idx]
-        if H.shape[1] != y.shape[0]:
-            raise ValueError("The number of samples in the input data does not match the number of samples in the model.")
-        
-        sig_assoc = (H @ y) / y.sum(axis=0)
-        sig_assoc_df = pd.DataFrame(sig_assoc, columns=y_df.columns)
-        return sig_assoc_df
-
-    def store_embeddings(self, adata: ad.AnnData, embedding_name: Optional[Union[List[str], str]] = None):
-        if embedding_name is not None:
-            if isinstance(embedding_name, str):
-                embedding_name = [embedding_name]
-            if len(embedding_name) != len(self.n_all_components):
-                raise ValueError("embedding_name must have the same length as all decomposed matrices!")
-            for i, name in enumerate(embedding_name):
-                adata.obsm[name] = self.Hs[i].T
-                adata.varm[name] = self.Ws[i]
-        else:
-            if not hasattr(self, 'condition_names'):
-                raise ValueError("Please provide the embedding names for all decomposed matrices!")
-
-            for i, name in enumerate(self.condition_names):
-                adata.obsm[name] = self.Hs[i].T
-                adata.varm[name] = self.Ws[i]
-
-        adata.obsm["ALPINE_embedding"] = self.Hs[-1].T
-        adata.varm["ALPINE_embedding"] = self.Ws[-1]
-
-    
-    def _check_params(self):
-        if not isinstance(self.n_components, int) or self.n_components <= 0:
-            raise ValueError("n_components must be a positive integer")
-        
-        if not all(isinstance(n, int) and n > 0 for n in self.n_all_components):
-            raise ValueError("n_batch_components must be a list of positive integers")
-        
-        if self.lam is None:
-            pass
-        else:
-            if len(self.lam) != len(self.n_covariate_components):
-                raise ValueError("lam must have the same length as n_all_components")
-        
-            if not all(isinstance(lam, (float, int)) and lam >= 0 for lam in self.lam):
-                raise ValueError("lam must be a list of non-negative floats or integers")
-
-        if self.random_state is not None and not isinstance(self.random_state, int):
-            raise ValueError("random_state must be None or an integer")
-
-
-    def _check_input(self):
-        if not isinstance(self.X, np.ndarray) or self.X.ndim != 2:
-            raise ValueError("X must be a 2D numpy array.")
-        if not all(isinstance(yi, np.ndarray) and yi.ndim == 2 for yi in self.y):
-            raise ValueError("All elements of y must be 2D numpy arrays.")
-        if len(self.y) != len(self.n_covariate_components):
-            print(len(self.y), len(self.n_covariate_components))
-            raise ValueError("Number of batch components must match the number of y matrices.")
-        if any(yi.shape[1] != self.X.shape[1] for yi in self.y):
-            raise ValueError("All y matrices must have the same number of columns as X.")
-
-
-    def _check_decomposed_matrices(self):
-
-        if self.random_state is not None:
-            torch.manual_seed(self.random_state)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(self.random_state)
-                
-        n_feature, n_sample = self.X.shape
-
-        if self.Ws is not None:
-            self.Ws = [torch.tensor(w, dtype=torch.float32, device=self.device) for w in self.Ws]
-        else:
-            self.Ws = [torch.rand((n_feature, k), dtype=torch.float32, device=self.device) for k in self.n_all_components]
-            
-        if self.Hs is not None:
-            self.Hs = [torch.tensor(h, dtype=torch.float32, device=self.device) for h in self.Hs]
-        else:
-            self.Hs = [torch.rand((k, n_sample), dtype=torch.float32, device=self.device) for k in self.n_all_components]
-
-        if self.Bs is not None:
-            self.Bs = [torch.tensor(b, dtype=torch.float32, device=self.device) for b in self.Bs]
-        else:
-            self.Bs = [torch.rand((_y.shape[0], k), dtype=torch.float32, device=self.device) for (_y, k) in zip(self.y, self.n_covariate_components)]
-
-        self.M_y = [torch.tensor(m, dtype=torch.float32, device=self.device) for m in self.M_y]
-
-    def _check_non_negative(self, X):
-        if not np.all(X >= 0):
-            return False
-
-
-    def _process_lam(self, lam):
-        if lam is None:
-            return None
-        if isinstance(lam, (float, int)):
-            return [lam] * len(self.n_covariate_components)
-        if len(lam) != len(self.n_covariate_components):
-            raise ValueError("Length of lam must match n_batch_components")
-        return lam
-
-
-    def _process_input(self, X: ad.AnnData, y: Union[List[str], str]):
-        if isinstance(X, ad.AnnData):
-            if isinstance(X.X, (np.ndarray, np.generic)):
-                X_processed = X.X.T
-            else:
-                X_processed = X.X.toarray().T
-            condition_names = [y] if isinstance(y, str) else y
-            y_processed = [X.obs[col] for col in condition_names]
-        else:
-            raise ValueError("X must be either an AnnData object or a numpy array.")
-        return X_processed, y_processed, condition_names
-    
-
-    def _to_dummies(self, y):
-        dummies_df = pd.get_dummies(y, dtype=float)
-        labels = dummies_df.columns.tolist()
-        mask = np.ones_like(dummies_df.values, dtype=float)
-        mask[dummies_df.sum(axis=1) == 0] = 0
-
-        return dummies_df.values.T, labels, mask.T
-
-    def _to_dummies_from_train (self, i, y):
-        dummies_df = pd.get_dummies(y, dtype=float)
-        dummies_df = dummies_df.reindex(columns=self.y_labels[i], fill_value=0)
-        mask = np.ones_like(dummies_df.values, dtype=float)
-        mask[dummies_df.sum(axis=1) == 0] = 0
-
-        return dummies_df.values.T, mask.T
-    
-
-    def _kl_divergence(self, y, y_hat):
-        if torch.is_tensor(y):
-            return torch.sum(y * torch.log(torch.clamp(y / torch.clamp(y_hat, min=self.eps), min=self.eps)) - y + y_hat)
-        else:
-            return np.sum(y * np.log(np.clip(y / np.clip(y_hat, a_min=self.eps, a_max=None), a_min=self.eps, a_max=None)) - y + y_hat)
-
-
-    def _get_best_max_iter (self, loss_history):
-        kneedle = KneeLocator(np.arange(0, loss_history.shape[0]), 
-                              np.log10(loss_history["reconstruction_loss"].values), 
-                              curve='convex', direction='decreasing')
-        return kneedle.elbow
-    
-
-    def _fit(self, sample_weights, verbose):
-
-        X = torch.tensor(self.X, dtype=torch.float32, device=self.device)
-        n_sample = X.shape[1]
-        y = [torch.tensor(y, dtype=torch.float32, device=self.device) for y in self.y]
-
-        Ws, Hs, Bs, M_y = deepcopy(self.Ws), deepcopy(self.Hs), deepcopy(self.Bs), deepcopy(self.M_y)
-
-        if self.lam is None:
-            W = torch.cat(Ws, dim=1)
-            H = torch.cat(Hs, dim=0)
-            recon_loss = torch.norm(X - W @ H, 'fro')**2
-            if self.loss_type == "kl-divergence":
-                label_loss = [self._kl_divergence(_y, _b @ _h) for _y, _b, _h in zip(y, Bs, Hs[:len(self.n_covariate_components)])]
-                self.lam = [(recon_loss.item() / 1e+3) / ll.clamp(min=self.eps).item() for ll in label_loss]
-            else:
-                label_loss = [torch.norm(_y - _b @ _h, 'fro')**2 for _y, _b, _h in zip(y, Bs, Hs[:len(self.n_covariate_components)])]
-                self.lam = [(recon_loss.item() / 1e+2) / ll.clamp(min=self.eps).item() for ll in label_loss]
-
-        loss_history = []
-
-        # orthogonal constraint
-        orthogonal_matrix = torch.zeros((self.total_components, self.total_components), dtype=torch.float32, device=self.device)
-        start_idx = 0
-        for i in range(len(self.n_all_components)):
-            end_idx = start_idx + Ws[i].shape[1]
-            k = Ws[i].shape[1]
-            weights = self.orth_W * (self.total_components / k)
-            orthogonal_matrix[start_idx:end_idx, start_idx:end_idx] = weights * torch.ones(k, k, device=self.device) - torch.eye(k, device=self.device)
-            start_idx = end_idx
-
-        pbar = tqdm(total=self.max_iter, desc="Epoch", ncols=150) if verbose else nullcontext()
-        with pbar:
-            for _ in range(self.max_iter):
-                for _ in range(0, n_sample, self.batch_size):
-                    if isinstance(sample_weights, bool) and sample_weights:
-                        joint_labels = ["+".join(str(y.iloc[j]) for y in self.y_input) for j in range(len(self.y_input[0]))]
-                        sample_weights = compute_sample_weight(class_weight='balanced', y=joint_labels)
-                        sample_weights = torch.tensor(sample_weights / np.sum(sample_weights), dtype=torch.float32, device=self.device)
-                        indices = torch.multinomial(sample_weights, min(self.batch_size, len(sample_weights)), replacement=False)
-                    else:
-                        indices = torch.randperm(n_sample, device=self.device)[:self.batch_size]
-
-                    X_sub = X[:, indices]
-                    Hs_sub = [h[:, indices] for h in Hs]
-                    y_sub = [_y[:, indices] for _y in y]
-                    M_y_sub = [m[:, indices] for m in M_y]
-
-                    # update W
-                    W = torch.cat(Ws, dim=1)
-                    H_sub = torch.cat(Hs_sub, dim=0)
-
-                    W_numerator = X_sub @ H_sub.T
-                    # W_denominator = W @ H_sub @ H_sub.T
-
-                    # orthogonal constraint + l2 norm
-                    W_denominator = W @ (H_sub @ H_sub.T +  (1 - self.l1_ratio) * self.alpha_W * torch.eye(self.total_components, device=self.device) + orthogonal_matrix)
-
-                    # orthogonal constraint
-                    # W_denominator = W @ (H_sub @ H_sub.T + orthogonal_matrix)
-
-                    # l1 norm
-                    W_denominator += self.l1_ratio * self.alpha_W * torch.ones_like(W_denominator)
-
-                    # orthogonal on the entire W
-                    # W_denominator = W @ (H_sub @ H_sub.T + self.alpha_W * (torch.ones_like(H_sub @ H_sub.T) - torch.eye(H_sub.shape[0], device=self.device)))
-
-
-
-                    W *= torch.div(torch.clamp(W_numerator, min=self.eps), torch.clamp(W_denominator, min=self.eps))
-
-                    start_idx = 0
-                    for idx, w in enumerate(Ws):
-                        end_idx = start_idx + w.shape[1]
-                        Ws[idx] = W[:, start_idx:end_idx]
-                        start_idx = end_idx
-
-                    for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
-                        if self.loss_type == "kl-divergence":
-                            B_numerator = torch.div((M * y_b), torch.clamp(M * (B_b @ H_b), min=self.eps)) @ H_b.T
-                            B_denominator = torch.ones_like(y_b) @ H_b.T
-                        else:
-                            B_numerator = (M * y_b) @ H_b.T
-                            B_denominator = (M * (B_b @ H_b)) @ H_b.T
-
-                        Bs[b] *= torch.div(torch.clamp(B_numerator, min=self.eps), torch.clamp(B_denominator, min=self.eps))
-
-
-                    # update partial H
-                    H_label_numerator = torch.zeros_like(H_sub) + self.eps
-                    H_label_denominator = torch.zeros_like(H_sub) + self.eps
-
-                    start_idx = 0
-                    for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
-                        end_idx = start_idx + H_b.shape[0]
-                        if self.loss_type == "kl-divergence":
-                            H_numerator = self.lam[b] * B_b.T @ torch.div((M * y_b), torch.clamp(M *(B_b @ H_b), min=self.eps))
-                            H_denominator = self.lam[b] * B_b.T @ torch.ones_like(y_b)
-                        else:
-                            H_numerator = 2 * self.lam[b] * B_b.T @ (M * y_b)
-                            H_denominator = 2 * self.lam[b] * B_b.T @ (M * (B_b @ H_b))
-
-                        H_label_numerator[start_idx:end_idx] += H_numerator
-                        H_label_denominator[start_idx:end_idx] += H_denominator
-                        start_idx = end_idx
-
-                    # update H
-                    W = torch.cat(Ws, dim=1)
-                    H_bio_numerator = 2 * W.T @ X_sub
-                    H_bio_denominator = 2 * W.T @ W @ H_sub
-
-                    numerator = torch.clamp(H_bio_numerator + H_label_numerator, min=self.eps)
-                    denominator = torch.clamp(H_bio_denominator + H_label_denominator, min=self.eps)
-                    H_sub *= torch.div(numerator, denominator)
-
-                    start_idx = 0
-                    for idx, h in enumerate(Hs):
-                        end_idx = start_idx + h.shape[0]
-                        h[:, indices] = H_sub[start_idx:end_idx]
-                        start_idx = end_idx
-
-
-                # loss calculation
-                # all the loss calculate on cpu
-                W = torch.cat(Ws, dim=1)
-                H = torch.cat(Hs, dim=0)
-                recon_loss = torch.norm(X - W @ H, 'fro')**2
-
-                if self.loss_type == "kl-divergence":
-                    label_loss = [self._kl_divergence(_y, _b @ _h) for _y, _b, _h in zip(y, Bs, Hs)]
-                else:
-                    label_loss = [torch.norm(_y - _b @ _h, 'fro')**2 for _y, _b, _h in zip(y, Bs, Hs)]
-
-                weighted_label_loss = [self.lam[i] * ll for i, ll in enumerate(label_loss)]
-                label_total_loss = torch.sum(torch.stack(weighted_label_loss))
-                loss = recon_loss + label_total_loss
-                loss_history.append([recon_loss.item()] + [l.item() for l in weighted_label_loss] + [loss.item()])
-
-                # update lambda
-                # self.lam = [torch.clamp(self.lam[i]-0.01*torch.log(1 + label_loss[i]), min=self.eps).item() for i in range(len(self.lam))]
-
-                if verbose:
-                    pbar.set_postfix({"objective loss": loss.item()})
-                    pbar.update(1)
-
-        Ws = [_w.cpu().numpy() for _w in Ws]
-        Hs = [_h.cpu().numpy() for _h in Hs]
-        Bs = [_b.cpu().numpy() for _b in Bs]
-
-        # Save the loss history
-        self.loss_history = pd.DataFrame(
-            loss_history,
-            columns=["reconstruction_loss"] +
-                    [f"prediction_loss_{i+1}" for i in range(len(self.n_covariate_components))] +
-                    ["total_loss"]
-        )
-        return Ws, Hs, Bs
-
-
-    def _transform_wo_labels(
-        self, X: ad.AnnData,
+        self,
+        adata: ad.AnnData,
         n_iter: Optional[int] = None,
-        batch_size = None,
-        lam = None        
-    ):
-        if self.random_state is not None:
-            torch.manual_seed(self.random_state)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(self.random_state)
+    ) -> None:
+        # Check if the model has been trained
+        if not hasattr(self, "matrices"):
+            raise RuntimeError("Model is not trained yet. Please fit the model first.")
 
-        y = self.condition_names
-        X_new, _, _ = self._process_input(X, y)
-        X_new = torch.tensor(X_new, dtype=torch.float32, device=self.device)
+        if not isinstance(adata, ad.AnnData):
+            raise TypeError("adata must be an AnnData object.")
 
-        Ws = [torch.tensor(w, dtype=torch.float32, device=self.device) for w in self.Ws]
-        W = torch.cat(Ws, dim=1)
+        if not isinstance(n_iter, (int, type(None))) or (
+            n_iter is not None and n_iter <= 0
+        ):
+            raise ValueError("n_iter must be a positive integer or None.")
 
-        n_sample = X_new.shape[1]
-        Hs_new = [torch.rand((k, n_sample), dtype=torch.float32, device=self.device) for k in self.n_all_components]
-        H = torch.cat(Hs_new, dim=0)
+        n_iter = n_iter if n_iter is not None else self.max_iter
+        self._transform(adata, n_iter)
 
-        for i in range(n_iter):
-            numerator = torch.clamp(2 * W.T @ X_new, min=self.eps)
-            denominator = torch.clamp(2 * W.T @ W @ H, min=self.eps)
-            H *= torch.div(numerator, denominator)
-            H = torch.clamp(H, min=self.eps)
+    def fit_transform(
+        self,
+        adata: ad.AnnData,
+        covariate_keys: List[str],
+        batch_size: Optional[int] = None,
+        max_iter: Optional[int] = None,
+        sampling_method: str = "random",
+        verbose: bool = False,
+    ) -> None:
+        self.fit(
+            adata,
+            covariate_keys,
+            batch_size=batch_size,
+            max_iter=max_iter,
+            sampling_method=sampling_method,
+            verbose=verbose,
+        ).transform(adata)
+
+    def compute_loss(self, adata: ad.AnnData):
+        if not hasattr(self, "matrices"):
+            raise RuntimeError("Model is not trained yet. Please fit the model first.")
+
+        if not isinstance(adata, ad.AnnData):
+            raise TypeError("adata must be an AnnData object.")
+
+        if "ALPINE_embedding" not in adata.obsm:
+            raise ValueError(
+                "ALPINE_embedding not found in adata.obsm. Please transform the data first."
+            )
+
+        def kl_divergence(y, y_hat):
+            y_hat = np.clip(y_hat, a_min=self.eps, a_max=None)
+            return np.sum(
+                y * np.log(np.clip(y / y_hat, a_min=self.eps, a_max=None)) - y + y_hat
+            )
+
+        X = copy(adata.X).astype(np.float32).T  # type: ignore
+
+        # get Ws and Hs
+        Ws, Hs = [], []
+        for _, covariate in enumerate(self.covariate_keys):
+            Hs.append(copy(adata.obsm[covariate].T))
+            Ws.append(copy(adata.varm[covariate]))
+        Hs.append(copy(adata.obsm["ALPINE_embedding"].T))
+        Ws.append(copy(adata.varm["ALPINE_weights"]))
+
+        # compute the reconstruction loss
+        W = np.concatenate(Ws, axis=1)
+        H = np.concatenate(Hs, axis=0)
+        recon_loss = np.linalg.norm(X - W @ H, ord="fro") ** 2
+
+        # label matrices
+        Ys = self.fe.transform(adata.obs)  # type: ignore
+        Bs = self.matrices["Bs"]
+
+        # compute the prediction loss
+        if self.loss_type == "kl-divergence":
+            pred_loss = [kl_divergence(Ys[i].T, Bs[i] @ Hs[i]) for i in range(len(Ys))]
+        else:
+            pred_loss = [
+                np.linalg.norm(Ys[i].T - Bs[i] @ Hs[i], ord="fro") ** 2
+                for i in range(len(Ys))
+            ]
+
+        total_loss = recon_loss + sum(
+            [self.lam[i] * pl for i, pl in enumerate(pred_loss)]
+        )
+        return total_loss
+
+    def get_decomposed_matrices(
+        self,
+    ) -> Dict[str, Union[Float32Array, Union[Float32Array, List[Float32Array]]]]:
+        if not hasattr(self, "matrices"):
+            raise RuntimeError("Model is not trained yet. Please fit the model first.")
+        else:
+            return self.matrices
+
+    def get_covariate_gene_scores(
+            self,
+            adata: Optional[ad.AnnData] = None,
+        ) -> Union[Dict[str, pd.DataFrame], None]:
         
-        start_idx = 0
-        for idx, h in enumerate(Hs_new):
-            end_idx = start_idx + h.shape[0]
-            Hs_new[idx] = H[start_idx:end_idx]
+        if not hasattr(self, "matrices"):
+            raise RuntimeError("Model is not trained yet. Please fit the model first.")
+
+        cov_gene_scores = {}
+        for i, covariate in enumerate(self.covariate_keys):
+            W = self.matrices["Ws"][i]
+            H = self.matrices["Hs"][i]
+            Y = self.matrices["Ys"][i]
+
+            HY = H @ Y.T / Y.sum(axis=1)
+            cond_genes = W @ HY
+
+            colnames = self.fe.encoded_labels[covariate]
+            cov_gene_scores[covariate] = pd.DataFrame(
+                cond_genes, index=self.feature_names, columns=colnames
+            )
+
+        if adata is None:
+            return cov_gene_scores
+        else:
+            for condition, df in cov_gene_scores.items():
+                adata.varm[condition + "_gene_scores"] = df
+            return None
+
+    def get_normalized_expression(
+        self, adata: ad.AnnData, library_size: Optional[float] = None
+    ) -> None:
+        # the get_normalized_expression will used the transformed ALPINE_embedding to recontruct the counts
+        # therefore, need to ensure model is trained and data is transformed
+        if not hasattr(self, "matrices"):
+            raise RuntimeError("Model is not trained yet. Please fit the model first.")
+        elif not isinstance(adata, ad.AnnData):
+            raise TypeError("adata must be an AnnData object.")
+        elif "ALPINE_embedding" not in adata.obsm:
+            raise ValueError(
+                "ALPINE_embedding not found in adata.obsm. Please transform the data first."
+            )
+        elif (library_size is not None) and (library_size <= 0):
+            raise ValueError("library_size must be a positive float.")
+
+        # Reconstruct the counts from the learned matrices
+        W: Float32Array = self.matrices["Ws"][-1]
+        H: Float32Array = adata.obsm["ALPINE_embedding"].T  # type: ignore
+        X_normalized = np.dot(W, H).astype(np.float32).T
+
+        # If library_size is not provided, use the default target_sum=None
+        temp = ad.AnnData(X_normalized)
+        sc.pp.normalize_total(temp, target_sum=library_size)
+
+        # save the normalized_expression into the adata.layers
+        adata.layers["normalized_expression"] = copy(temp.X)
+
+    def store_embeddings(self, adata: ad.AnnData) -> None:
+        # check whether the model has been trained and validate the input
+        if not hasattr(self, "matrices"):
+            raise RuntimeError("Model is not trained yet. Please fit the model first.")
+        elif not isinstance(adata, ad.AnnData):
+            raise TypeError("adata must be an AnnData object.")
+
+        # save the unguided parts
+        adata.obsm["ALPINE_embedding"] = copy(self.matrices["Hs"][-1].T)
+        adata.varm["ALPINE_weights"] = copy(self.matrices["Ws"][-1])
+
+        dummy_matrices = self.fe.transform(adata.obs)  # type: ignore
+
+        # save the guided parts (covariate assocaited)
+        for i, covariate in enumerate(self.covariate_keys):
+            adata.obsm[covariate] = copy(self.matrices["Hs"][i].T)
+            adata.obsm[f"{covariate}_dummy_matrix"]  = dummy_matrices[i]  # type: ignore
+            adata.varm[covariate] = copy(self.matrices["Ws"][i])
+
+    def _validate_init_args(self) -> None:
+        # validate n_components
+        if self.n_components <= 0:
+            raise ValueError("n_components must be greater than 0.")
+
+        # validate n_covariate_components
+        if not isinstance(self.n_covariate_components, list):
+            raise TypeError("n_covariate_components must be a list.")
+        else:
+            for n in self.n_covariate_components:
+                if not isinstance(n, int) or n < 0:
+                    raise ValueError(
+                        "Each element in n_covariate_components must be a non-negative integer."
+                    )
+
+        # validate lam
+        if not isinstance(self.lam, list):
+            raise TypeError("lam must be in a list.")
+        else:
+            for lam in self.lam:
+                if not isinstance(lam, float) or lam < 0:
+                    raise ValueError(
+                        "Each element in lam must be a non-negative float."
+                    )
+
+        # validate alpha_W
+        if not isinstance(self.alpha_W, float) or self.alpha_W < 0:
+            raise ValueError("alpha_W must be a non-negative float.")
+
+        # validate orth_W
+        if not isinstance(self.orth_W, float) or self.orth_W < 0:
+            raise ValueError("orth_W must be a non-negative float.")
+
+        # validate l1_ratio_W
+        if (
+            not isinstance(self.l1_ratio_W, float)
+            or self.l1_ratio_W < 0
+            or self.l1_ratio_W > 1
+        ):
+            raise ValueError("l1_ratio_W must be a float between 0 and 1.")
+
+        # validate scale_needed
+        if not isinstance(self.scale_needed, bool):
+            raise TypeError("scale_needed must be a boolean.")
+
+        # validate loss_type
+        if not isinstance(self.loss_type, str):
+            raise TypeError("loss_type must be a string.")
+        else:
+            valid_loss_types = ["kl-divergence", "frobenius"]
+            if self.loss_type not in valid_loss_types:
+                raise ValueError(f"loss_type must be one of {valid_loss_types}.")
+
+        # validate eps
+        if not isinstance(self.eps, float) or self.eps < 0:
+            raise ValueError("eps must be a non-negative float.")
+
+        # validate random_state
+        if not isinstance(self.random_state, int) or self.random_state < 0:
+            raise ValueError("random_state must be a non-negative integer.")
+
+    def _validate_fit_args(
+        self,
+        adata,
+        covariate_keys,
+        batch_size,
+        max_iter,
+        sampling_method,
+        verbose,
+    ) -> None:
+        if not isinstance(adata, ad.AnnData):
+            raise TypeError("adata must be an AnnData object.")
+
+        if not isinstance(adata.X, np.ndarray):
+            raise TypeError("adata.X must be a numpy array.")
+        elif adata.X.ndim != 2:
+            raise ValueError("adata.X must be a 2D numpy array.")
+        elif not np.all(adata.X >= 0):
+            raise ValueError("All elements in adata.X must be non-negative.")
+
+        if not isinstance(covariate_keys, list):
+            raise TypeError("covariate_keys must be a list.")
+        elif not len(covariate_keys) == len(self.n_covariate_components):
+            raise ValueError(
+                "Length of covariate_keys must match length of n_covariate_components."
+            )
+        else:
+            for key in covariate_keys:
+                if not isinstance(key, str):
+                    raise TypeError("Each element in covariate_keys must be a string.")
+
+                if key not in adata.obs.columns:
+                    raise ValueError(f"Covariate key '{key}' not found in adata.obs.")
+                if not adata.obs[key].dtype.kind == "O":
+                    raise TypeError(
+                        f"Covariate '{key}' in adata.obs must be a categorical or object type variable."
+                    )
+
+        if (
+            batch_size is not None
+            and not isinstance(batch_size, int)
+            and batch_size > 0
+        ):
+            raise TypeError("batch_size must be a positive integer.")
+
+        if max_iter is not None and not isinstance(max_iter, int) and max_iter > 0:
+            raise TypeError("max_iter must be a positive integer.")
+
+        if not isinstance(sampling_method, str):
+            raise TypeError("sampling_method must be a string.")
+
+        if not isinstance(verbose, bool):
+            raise TypeError("verbose must be a boolean.")
+
+    def _initialize_matrices(
+        self, X_array: Float32Array, Y_list_array: List[Float32Array]
+    ) -> AlpineMatrices:
+        # set random seed for cpu and gpu
+        torch.manual_seed(self.random_state)
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed(self.random_state)
+
+        # convert numpy arrays to torch tensors
+        X: torch.Tensor = torch.tensor(X_array, dtype=torch.float32, device=self.device)
+        Y: List[torch.Tensor] = [
+            torch.tensor(y.T, dtype=torch.float32, device=self.device)
+            for y in Y_list_array
+        ]
+
+        n_features, n_samples = X.shape
+
+        # random initialize the Ws, Hs, and Bs
+        Ws: List[torch.Tensor] = [
+            torch.rand((n_features, k), dtype=torch.float32, device=self.device)
+            for k in self.n_all_components
+        ]
+        Ws = [w.clamp(min=self.eps) for w in Ws]
+
+        Hs: List[torch.Tensor] = [
+            torch.rand((k, n_samples), dtype=torch.float32, device=self.device)
+            for k in self.n_all_components
+        ]
+        Hs = [h.clamp(min=self.eps) for h in Hs]
+
+        Bs: List[torch.Tensor] = [
+            torch.rand((y.shape[0], k), dtype=torch.float32, device=self.device)
+            for (y, k) in zip(Y, self.n_covariate_components)
+        ]
+        Bs = [b.clamp(min=self.eps) for b in Bs]
+
+        return AlpineMatrices(X, Y, Ws, Hs, Bs)
+
+    def _compute_orthogonal_matrix(self, size: int) -> torch.Tensor:
+        # orthogonal matrix
+        orth_mat: torch.Tensor = torch.ones(
+            (size, size),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        orth_mat -= torch.eye(size, dtype=torch.float32, device=self.device)
+        orth_mat = self.orth_W * orth_mat
+
+        return orth_mat
+
+    def _fit(self, m: AlpineMatrices) -> None:
+        loss_history: List[List[float]] = []
+
+        # setting progress bar
+        pbar = (
+            tqdm(total=self.max_iter, desc="Iteration", ncols=100)
+            if self.verbose
+            else nullcontext()
+        )
+
+        joint_labels = create_joint_labels_from_dummy_matrices(m.Ys)
+
+        with torch.no_grad():
+            with pbar:
+                for i_iter in range(self.max_iter):
+                    # Generate indices for the entire epoch
+                    epoch_indices = generate_epoch_indices(
+                        joint_labels=joint_labels,
+                        sampling_method=self.sampling_method,
+                        device=self.device,
+                    )
+
+                    # calculate how many batches needed
+                    num_batches = get_num_batches(len(epoch_indices), self.batch_size)
+
+                    # iterate over all batches
+                    for batch_num in range(num_batches):
+                        batch_indices = get_batch_indices(
+                            epoch_indices, batch_num, self.batch_size
+                        )
+                        if len(batch_indices) == 0:
+                            break
+
+                        # Precompute reused views
+                        X_batch = m.X[:, batch_indices]
+                        Ys_batch = [Y[:, batch_indices] for Y in m.Ys]
+
+                        if self.use_als:
+                            # ALS updates inlined
+                            for idx in range(len(self.n_all_components)):
+                                # === Update W[idx] ===
+                                Hs_batch = [h[:, batch_indices] for h in m.Hs]
+                                H_batch = Hs_batch[idx]
+                                W = m.Ws[idx]
+                                W_cat = torch.cat(m.Ws, dim=1)
+                                H_cat_batch = torch.cat(Hs_batch, dim=0)
+
+                                numerator = 2 * X_batch @ H_batch.T
+                                eye_mat = torch.eye(
+                                    W.shape[1], dtype=torch.float32, device=self.device
+                                )
+                                orth_mat = self._compute_orthogonal_matrix(W.shape[1])
+                                denominator = (
+                                    2 * W_cat @ H_cat_batch @ H_batch.T
+                                    + (1 - self.l1_ratio_W) * self.alpha_W * W @ eye_mat
+                                    + W @ orth_mat
+                                )
+                                denominator += self.l1_ratio_W * self.alpha_W * torch.ones_like(denominator)
+                                denominator = torch.clamp(denominator, min=self.eps)
+                                m.Ws[idx] *= numerator / denominator
+
+                                # === Update B[idx] if covariate ===
+                                if idx < len(self.n_covariate_components):
+                                    Y_batch = Ys_batch[idx]
+                                    B = m.Bs[idx]
+                                    if self.loss_type == "kl-divergence":
+                                        numerator = (
+                                            self.lam[idx]
+                                            * (Y_batch / torch.clamp(B @ H_batch, min=self.eps))
+                                            @ H_batch.T
+                                        )
+                                        denominator = self.lam[idx] * torch.ones_like(Y_batch) @ H_batch.T
+                                    else:
+                                        numerator = 2 * Y_batch @ H_batch.T
+                                        denominator = 2 * B @ H_batch @ H_batch.T
+                                    denominator = torch.clamp(denominator, min=self.eps)
+                                    m.Bs[idx] *= numerator / denominator
+
+                                # === Update H[idx] ===
+                                W = m.Ws[idx]
+                                W_cat = torch.cat(m.Ws, dim=1)
+                                unguided_num = 2 * W.T @ X_batch
+                                unguided_den = 2 * W.T @ (W_cat @ H_cat_batch)
+
+                                if idx < len(self.covariate_keys):
+                                    Y_batch = Ys_batch[idx]
+                                    B = m.Bs[idx]
+                                    if self.loss_type == "kl-divergence":
+                                        guided_num = (
+                                            self.lam[idx]
+                                            * B.T @ (Y_batch / torch.clamp(B @ H_batch, min=self.eps))
+                                        )
+                                        guided_den = self.lam[idx] * B.T @ torch.ones_like(Y_batch)
+                                    else:
+                                        guided_num = 2 * self.lam[idx] * B.T @ Y_batch
+                                        guided_den = 2 * self.lam[idx] * B.T @ (B @ H_batch)
+                                    numerator = unguided_num + guided_num
+                                    denominator = unguided_den + guided_den
+                                    denominator = torch.clamp(denominator, min=self.eps)
+                                    m.Hs[idx][:, batch_indices] *= numerator / denominator
+                                else:
+                                    unguided_den = torch.clamp(unguided_den, min=self.eps)
+                                    m.Hs[idx][:, batch_indices] *= unguided_num / unguided_den
+                        else:
+                            # Multiplicative updates (non-ALS), inlined
+                            # === Update W ===
+                            W_cat = torch.cat(m.Ws, dim=1)
+                            Hs_batch = [h[:, batch_indices] for h in m.Hs]
+                            H_cat_batch = torch.cat(Hs_batch, dim=0)
+
+                            numerator = 2 * X_batch @ H_cat_batch.T
+                            orth_mat = self._compute_orthogonal_matrix(W_cat.shape[1])
+                            denominator = (
+                                2 * W_cat @ H_cat_batch @ H_cat_batch.T
+                                + (1 - self.l1_ratio_W) * self.alpha_W * W_cat
+                                + W_cat @ orth_mat
+                            )
+                            denominator += self.l1_ratio_W * self.alpha_W * torch.ones_like(denominator)
+                            denominator = torch.clamp(denominator, min=self.eps)
+                            W_cat *= numerator / denominator
+
+                            # split back into m.Ws
+                            start = 0
+                            for idx, w in enumerate(m.Ws):
+                                end = start + w.shape[1]
+                                m.Ws[idx] = W_cat[:, start:end]
+                                start = end
+
+                            # === Update Bs ===
+                            for i in range(len(self.covariate_keys)):
+                                Yb, Hb, B = Ys_batch[i], Hs_batch[i], m.Bs[i]
+                                if self.loss_type == "kl-divergence":
+                                    numerator = (
+                                        self.lam[i]
+                                        * (Yb / torch.clamp(B @ Hb, min=self.eps))
+                                        @ Hb.T
+                                    )
+                                    denominator = self.lam[i] * torch.ones_like(Yb) @ Hb.T
+                                else:
+                                    numerator = 2 * Yb @ Hb.T
+                                    denominator = 2 * B @ Hb @ Hb.T
+                                denominator = torch.clamp(denominator, min=self.eps)
+                                m.Bs[i] *= numerator / denominator
+
+                            # === Update H ===
+                            W_cat = torch.cat(m.Ws, dim=1)
+                            numerator = torch.zeros_like(H_cat_batch)
+                            denominator = torch.zeros_like(H_cat_batch)
+
+                            # prediction part
+                            start = 0
+                            for i in range(len(self.covariate_keys)):
+                                end = start + Hs_batch[i].shape[0]
+                                if self.loss_type == "kl-divergence":
+                                    guided_num = (
+                                        self.lam[i]
+                                        * m.Bs[i].T @ (Ys_batch[i] / torch.clamp(m.Bs[i] @ Hs_batch[i], min=self.eps))
+                                    )
+                                    guided_den = self.lam[i] * m.Bs[i].T @ torch.ones_like(Ys_batch[i])
+                                else:
+                                    guided_num = 2 * self.lam[i] * m.Bs[i].T @ Ys_batch[i]
+                                    guided_den = 2 * self.lam[i] * m.Bs[i].T @ (m.Bs[i] @ Hs_batch[i])
+                                numerator[start:end] = guided_num
+                                denominator[start:end] = guided_den
+                                start = end
+
+                            # reconstruction part
+                            numerator += 2 * W_cat.T @ X_batch
+                            denominator += 2 * W_cat.T @ (W_cat @ H_cat_batch)
+                            denominator = torch.clamp(denominator, min=self.eps)
+                            H_cat_batch *= numerator / denominator
+
+                            # split back into m.Hs
+                            start = 0
+                            for j, H in enumerate(Hs_batch):
+                                end = start + H.shape[0]
+                                m.Hs[j][:, batch_indices] = H_cat_batch[start:end]
+                                start = end
+
+                    # compute loss
+                    loss = self._compute_loss(m)
+                    loss_history.append(loss)
+
+                    if self.verbose:
+                        pbar.set_postfix({"objective loss": loss[0]})  # type: ignore
+                        pbar.update(1)  # type: ignore
+
+                colnames = ["total loss", "reconstruction loss"] + [
+                    f"prediction loss({k})" for k in self.covariate_keys
+                ]
+                self.loss_history = pd.DataFrame(loss_history, columns=colnames)
+
+    def _transform(self, adata: ad.AnnData, n_iter: int) -> None:
+        # validate the input and convert to torch.Tensor
+        X_array: Float32Array = copy(adata.X).astype(np.float32).T  # type: ignore
+        if not np.all(X_array >= 0):
+            raise ValueError("All elements in adata.X must be non-negative.")
+        X: torch.Tensor = torch.tensor(X_array, dtype=torch.float32, device=self.device)
+        n_sample: int = X.shape[1]
+
+        # Initialize H_transformed
+        H_transformed: torch.Tensor = torch.rand(
+            (self.total_components, n_sample), dtype=torch.float32, device=self.device
+        )
+        Hs_transformed = [
+            torch.zeros((k, n_sample), dtype=torch.float32, device=self.device)
+            for k in self.n_all_components
+        ]
+
+        # convert np.ndarray to torch.Tensor
+        W: torch.Tensor = torch.cat(
+            [
+                torch.tensor(w, dtype=torch.float32, device=self.device)
+                for w in self.matrices["Ws"]
+            ],
+            dim=1,
+        )
+
+        # main transform loop (basic multiplicative update for H)
+        for _ in range(n_iter):
+            numerator = 2 * W.T @ X
+            denominator = 2 * W.T @ (W @ H_transformed)
+            denominator = torch.clamp(denominator, min=self.eps)
+            H_transformed *= numerator / denominator
+
+        # seperate entire H into individual part
+        start_idx, end_idx = 0, 0
+        for idx in range(len(Hs_transformed)):
+            end_idx = start_idx + Hs_transformed[idx].shape[0]
+            Hs_transformed[idx] = H_transformed[start_idx:end_idx]
             start_idx = end_idx
 
-        Hs_new = [h.cpu().numpy() for h in Hs_new]
-        for i, y_name in enumerate(y):
-            X.obsm[y_name] = Hs_new[i].T
-            X.varm[y_name] = deepcopy(self.Ws[i])
-        X.obsm["ALPINE_embedding"] = deepcopy(Hs_new[-1].T)
-        X.varm["ALPINE_embedding"] = deepcopy(self.Ws[-1])
+        # save the Hs_transformed_array into the adata
+        Hs_transformed_array = [H.cpu().numpy() for H in Hs_transformed]
+        for i, covariate in enumerate(self.covariate_keys):
+            adata.obsm[covariate] = Hs_transformed_array[i].T
+            adata.varm[covariate] = deepcopy(self.matrices["Ws"][i])
+        adata.obsm["ALPINE_embedding"] = Hs_transformed_array[-1].T
+        adata.varm["ALPINE_weights"] = deepcopy(self.matrices["Ws"][-1])
 
-        return Hs_new, _
+    def _compute_loss(self, m) -> List[float]:
+        def kl_divergence(y, y_hat):
+            y_hat = torch.clamp(y_hat, min=self.eps)
+            return torch.sum(
+                y * torch.log(torch.clamp(y / y_hat, min=self.eps)) - y + y_hat
+            ).item()
 
+        # compute the reconstruction loss
+        W = torch.cat(m.Ws, dim=1)
+        H = torch.cat(m.Hs, dim=0)
+        recon_loss = torch.norm(m.X - W @ H, p="fro") ** 2
+        recon_loss = recon_loss.item()
 
-    def _transform(
-            self, X: ad.AnnData, 
-            n_iter: Optional[int] = None,
-            batch_size = None,
-            lam = None
-        ):
+        # compute the prediction loss
+        if self.loss_type == "kl-divergence":
+            pred_loss = [
+                kl_divergence(m.Ys[i], m.Bs[i] @ m.Hs[i]) for i in range(len(m.Ys))
+            ]
+        else:
+            pred_loss = [
+                (torch.norm(m.Ys[i] - m.Bs[i] @ m.Hs[i], p="fro") ** 2).item()
+                for i in range(len(m.Ys))
+            ]
 
-        if self.random_state is not None:
-            torch.manual_seed(self.random_state)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(self.random_state)
-
-        y = self.condition_names
-        X_new, y_new_input, _ = self._process_input(X, y)
-        y_new, M_y = zip(*[self._to_dummies_from_train(i, yi) for i, yi in enumerate(y_new_input)])
-        M_y = [torch.tensor(m, dtype=torch.float32, device=self.device) for m in M_y]
-
-        X_new = torch.tensor(X_new, dtype=torch.float32, device=self.device)
-        y_new = [torch.tensor(yi, dtype=torch.float32, device=self.device) for yi in y_new]
-        Bs = [torch.tensor(b, dtype=torch.float32, device=self.device) for b in self.Bs]
-        Ws = [torch.tensor(w, dtype=torch.float32, device=self.device) for w in self.Ws]
-        W = torch.cat(Ws, dim=1)
-
-        n_sample = X_new.shape[1]
-        Hs_new = [torch.rand((k, n_sample), dtype=torch.float32, device=self.device) for k in self.n_all_components]
-        H_new = torch.cat(Hs_new, dim=0)
-
-        if lam is None:
-            W = torch.cat(Ws, dim=1)
-            H_new = torch.cat(Hs_new, dim=0)
-            recon_loss = torch.norm(X_new - W @ H_new, 'fro')**2
-            if self.loss_type == "kl-divergence":
-                label_loss = [self._kl_divergence(_y, _b @ _h) for _y, _b, _h in zip(y_new, Bs, Hs_new[:len(self.n_covariate_components)])]
-                lam = [(recon_loss.item() / 1e+3) / ll.clamp(min=self.eps).item() for ll in label_loss]
-            else:
-                label_loss = [torch.norm(_y - _b @ _h, 'fro')**2 for _y, _b, _h in zip(y_new, Bs, Hs_new[:len(self.n_covariate_components)])]
-                lam = [(recon_loss.item() / 1e+2) / ll.clamp(min=self.eps).item() for ll in label_loss]
-
-        loss_history = []
-        if batch_size is None:
-            batch_size = int(n_sample / 3)
-        for _ in range(n_iter):
-            for _ in range(0, n_sample, batch_size):
-                indices = torch.randperm(n_sample, device=self.device)[:batch_size]
-
-                X_sub = X_new[:, indices]
-                Hs_sub = [h[:, indices] for h in Hs_new]
-                y_sub = [_y[:, indices] for _y in y_new]
-                H_sub = torch.cat(Hs_sub, dim=0)
-                M_y_sub = [m[:, indices] for m in M_y]
-
-                H_label_numerator = torch.zeros_like(H_sub, device=self.device)
-                H_label_denominator = torch.zeros_like(H_sub, device=self.device)
-                
-                start_idx = 0
-                for b, (M, y_b, B_b, H_b) in enumerate(zip(M_y_sub, y_sub, Bs, Hs_sub[:len(self.n_covariate_components)])):
-                    end_idx = start_idx + H_b.shape[0]
-                    if self.loss_type == "kl-divergence":
-                        H_numerator = lam[b] * B_b.T @ torch.div(M * y_b, torch.clamp(M * (B_b @ H_b), min=self.eps))
-                        H_denominator = lam[b] * B_b.T @ torch.ones_like(y_b)
-                    else:
-                        H_numerator = 2 * lam[b] * B_b.T @ (M * y_b)
-                        H_denominator = 2 * lam[b] * B_b.T @ (M * (B_b @ H_b))
-                    
-                    H_label_numerator[start_idx:end_idx] += H_numerator
-                    H_label_denominator[start_idx:end_idx] += H_denominator
-                    start_idx = end_idx
-
-                # Update H
-                numerator = torch.clamp(2 * W.T @ X_sub + H_label_numerator, min=self.eps)
-                denominator = torch.clamp(2 * W.T @ W @ H_sub + H_label_denominator, min=self.eps)
-
-                H_sub *= torch.div(numerator, denominator)
-                
-                start_idx = 0
-                for idx, h in enumerate(Hs_new):
-                    end_idx = start_idx + h.shape[0]
-                    Hs_new[idx][:, indices] = H_sub[start_idx:end_idx]
-                    start_idx = end_idx
-
-            # loss calculation
-            H_new = torch.cat(Hs_new, dim=0)
-            recon_loss = torch.norm(X_new - W @ H_new, 'fro')**2
-
-            if self.loss_type == "kl-divergence":
-                label_loss = [self._kl_divergence(_y, _b @ _h) for _y, _b, _h in zip(y_new, Bs, Hs_new)]
-            else:
-                label_loss = [torch.norm(_y - _b @ _h, 'fro')**2 for _y, _b, _h in zip(y_new, Bs, Hs_new)]
-
-            label_loss = [lam[i] * ll for i, ll in enumerate(label_loss)]
-            label_total_loss = torch.sum(torch.stack(label_loss))
-            loss = recon_loss + label_total_loss
-            loss_history.append([recon_loss.item()] + [l.item() for l in label_loss] + [loss.item()])
-        
-        loss_history = pd.DataFrame(
-            loss_history,
-            columns=["reconstruction_loss"] +
-                    [f"prediction_loss_{i+1}" for i in range(len(self.n_covariate_components))] +
-                    ["total_loss"]
+        total_loss = recon_loss + sum(
+            [self.lam[i] * pl for i, pl in enumerate(pred_loss)]
         )
-        
-        Hs_new = [h.cpu().numpy() for h in Hs_new]
-        for i, y_name in enumerate(y):
-            X.obsm[y_name] = Hs_new[i].T
-            X.varm[y_name] = deepcopy(self.Ws[i])
-        X.obsm["ALPINE_embedding"] = deepcopy(Hs_new[-1].T)
-        X.varm["ALPINE_embedding"] = deepcopy(self.Ws[-1])
-        
-        return Hs_new, loss_history
+        return [total_loss, recon_loss] + pred_loss
+
+    def _compute_best_iter(self, train_loss) -> int:
+        # compute the best iteration based on the warm-up run
+        # using the Kneedle algorithm to find the elbow point
+        kneedle = KneeLocator(
+            np.arange(0, len(train_loss)),
+            np.log10(train_loss),
+            curve="convex",
+            direction="decreasing",
+            interp_method="polynomial",
+            polynomial_degree=2
+        )
+        if kneedle.elbow is not None:
+            return int(kneedle.elbow)
+        else:
+            warnings.warn("Kneedle elbow not found, using default max_iter=200")
+            return 200
+
+    def _scale_matrices(self, m: AlpineMatrices) -> None:
+        # normalize each signature in W to sum to 1
+        # the H and B are scaled based on the w_scaler
+        for i in range(len(m.Ws)):
+            w_scaler: torch.Tensor = m.Ws[i].sum(dim=0)
+            m.Ws[i] = m.Ws[i] / w_scaler
+            m.Hs[i] = m.Hs[i] * w_scaler.unsqueeze(1)
+
+            if i < len(self.n_covariate_components):
+                m.Bs[i] = m.Bs[i] / w_scaler
+
+    # def _update_W(self, m: AlpineMatrices, batch_indices: torch.Tensor) -> None:
+    #     X_batch = m.X[:, batch_indices]
+    #     H_batch = torch.cat([h[:, batch_indices] for h in m.Hs], dim=0)
+    #     W = torch.cat(m.Ws, dim=1)
+
+    #     numerator = 2 * X_batch @ H_batch.T
+    #     denominator = 2 * W @ H_batch @ H_batch.T
+
+    #     orth_mat: torch.Tensor = self._compute_orthogonal_matrix(W.shape[1])
+    #     denominator = (
+    #         2 * W @ H_batch @ H_batch.T
+    #         + (1 - self.l1_ratio_W) * self.alpha_W * W
+    #         + W @ orth_mat
+    #     )
+    #     denominator += self.l1_ratio_W * self.alpha_W * torch.ones_like(denominator)
+
+    #     denominator = torch.clamp(denominator, min=self.eps)
+
+    #     W *= numerator / denominator
+    #     start_idx = 0
+    #     for idx, w in enumerate(m.Ws):
+    #         end_idx = start_idx + w.shape[1]
+    #         m.Ws[idx] = W[:, start_idx:end_idx]
+    #         start_idx = end_idx
+
+    # def _update_B(self, m: AlpineMatrices, batch_indices: torch.Tensor) -> None:
+    #     Ys_batch = [Y[:, batch_indices] for Y in m.Ys]
+    #     Hs_batch = [H[:, batch_indices] for H in m.Hs]
+
+    #     for i in range(len(self.covariate_keys)):
+    #         numerator, denominator = None, None
+
+    #         if self.loss_type == "kl-divergence":
+    #             numerator = (
+    #                 self.lam[i]
+    #                 * torch.div(
+    #                     Ys_batch[i], torch.clamp(m.Bs[i] @ Hs_batch[i], min=self.eps)
+    #                 )
+    #                 @ Hs_batch[i].T
+    #             )
+    #             denominator = self.lam[i] * torch.ones_like(Ys_batch[i]) @ Hs_batch[i].T
+    #         else:
+    #             numerator = 2 * Ys_batch[i] @ Hs_batch[i].T
+    #             denominator = 2 * m.Bs[i] @ Hs_batch[i] @ Hs_batch[i].T
+
+    #         denominator = torch.clamp(denominator, min=self.eps)
+    #         m.Bs[i] *= numerator / denominator
+
+    # def _update_H(self, m: AlpineMatrices, batch_indices: torch.Tensor) -> None:
+    #     Hs_batch = [h[:, batch_indices] for h in m.Hs]
+    #     Ys_batch = [Y[:, batch_indices] for Y in m.Ys]
+    #     H_batch = torch.cat(Hs_batch, dim=0)
+    #     X_batch = m.X[:, batch_indices]
+
+    #     numerator = torch.zeros_like(H_batch)
+    #     denominator = torch.zeros_like(H_batch)
+
+    #     # guided part
+    #     start_idx = 0
+    #     for i in range(len(self.covariate_keys)):
+    #         end_idx = start_idx + Hs_batch[i].shape[0]
+
+    #         guided_numerator, guided_denominator = None, None
+    #         if self.loss_type == "kl-divergence":
+    #             guided_numerator = (
+    #                 self.lam[i]
+    #                 * m.Bs[i].T
+    #                 @ torch.div(
+    #                     Ys_batch[i], torch.clamp(m.Bs[i] @ Hs_batch[i], min=self.eps)
+    #                 )
+    #             )
+    #             guided_denominator = (
+    #                 self.lam[i] * m.Bs[i].T @ torch.ones_like(Ys_batch[i])
+    #             )
+    #         else:
+    #             guided_numerator = 2 * self.lam[i] * m.Bs[i].T @ Ys_batch[i]
+    #             guided_denominator = 2 * self.lam[i] * m.Bs[i].T @ m.Bs[i] @ Hs_batch[i]
+
+    #         numerator[start_idx:end_idx] = guided_numerator
+    #         denominator[start_idx:end_idx] = guided_denominator
+    #         start_idx = end_idx
+
+    #     # unguided part
+    #     W = torch.cat(m.Ws, dim=1)
+    #     unguided_numerator = 2 * W.T @ X_batch
+    #     unguided_denominator = 2 * W.T @ (W @ H_batch)
+
+    #     numerator += unguided_numerator
+    #     denominator += unguided_denominator
+
+    #     denominator = torch.clamp(denominator, min=self.eps)
+    #     H_batch *= numerator / denominator
+
+    #     start_idx = 0
+    #     for j in range(len(Hs_batch)):
+    #         end_idx = start_idx + Hs_batch[j].shape[0]
+    #         m.Hs[j][:, batch_indices] = H_batch[start_idx:end_idx]
+    #         start_idx = end_idx
+
+    # def _als_update_Ws(
+    #     self, m: AlpineMatrices, batch_indices: torch.Tensor, idx: int
+    # ) -> None:
+    #     X_batch: torch.Tensor = m.X[:, batch_indices]
+    #     H_cat_batch: torch.Tensor = torch.cat(
+    #         [h[:, batch_indices] for h in m.Hs], dim=0
+    #     )
+    #     H_batch: torch.Tensor = m.Hs[idx][:, batch_indices]
+    #     W_cat: torch.Tensor = torch.cat(m.Ws, dim=1)
+    #     W: torch.Tensor = m.Ws[idx]
+
+    #     # calculate the numerator and denominator including the regularization term
+    #     numerator: torch.Tensor = 2 * X_batch @ H_batch.T
+
+    #     # Ensure all terms inside the parentheses have the same shape
+    #     eye_mat: torch.Tensor = torch.eye(
+    #         W.shape[1], dtype=torch.float32, device=self.device
+    #     )
+    #     orth_mat: torch.Tensor = self._compute_orthogonal_matrix(W.shape[1])
+    #     denominator = (
+    #         2 * W_cat @ H_cat_batch @ H_batch.T
+    #         + (1 - self.l1_ratio_W) * self.alpha_W * W @ eye_mat
+    #         + W @ orth_mat
+    #     )
+    #     denominator += self.l1_ratio_W * self.alpha_W * torch.ones_like(denominator)
+    #     denominator = torch.clamp(denominator, min=self.eps)
+
+    #     # update W
+    #     m.Ws[idx] *= numerator / denominator
+
+    # def _als_update_Bs(
+    #     self, m: AlpineMatrices, batch_indices: torch.Tensor, idx: int
+    # ) -> None:
+    #     # note: Hs_batch only retrieve from 0:len(m.Ys)
+    #     Y_batch: torch.Tensor = m.Ys[idx][:, batch_indices]
+    #     H_batch: torch.Tensor = m.Hs[idx][:, batch_indices]
+    #     B: torch.Tensor = m.Bs[idx]
+
+    #     numerator = None
+    #     denominator = None
+
+    #     if self.loss_type == "kl-divergence":
+    #         numerator = (
+    #             self.lam[idx]
+    #             * torch.div(Y_batch, torch.clamp(B @ H_batch, min=self.eps))
+    #             @ H_batch.T
+    #         )
+    #         denominator = self.lam[idx] * torch.ones_like(Y_batch) @ H_batch.T
+    #     else:
+    #         numerator = 2 * Y_batch @ H_batch.T
+    #         denominator = 2 * B @ H_batch @ H_batch.T
+
+    #     denominator = torch.clamp(denominator, min=self.eps)
+
+    #     # update B[i]
+    #     m.Bs[idx] *= numerator / denominator
+
+    # def _als_update_Hs(
+    #     self, m: AlpineMatrices, batch_indices: torch.Tensor, idx: int
+    # ) -> None:
+    #     X_batch: torch.Tensor = m.X[:, batch_indices]
+    #     H_batch: torch.Tensor = m.Hs[idx][:, batch_indices]
+    #     H_cat_batch: torch.Tensor = torch.cat(
+    #         [h[:, batch_indices] for h in m.Hs], dim=0
+    #     )
+
+    #     W: torch.Tensor = m.Ws[idx]
+    #     W_cat: torch.Tensor = torch.cat(m.Ws, dim=1)
+
+    #     unguided_numerator: torch.Tensor = 2 * W.T @ X_batch
+    #     unguided_denominator: torch.Tensor = 2 * W.T @ (W_cat @ H_cat_batch)
+    #     unguided_denominator = torch.clamp(unguided_denominator, min=self.eps)
+
+    #     if idx < len(self.covariate_keys):
+    #         Y_batch: torch.Tensor = m.Ys[idx][:, batch_indices]
+    #         B: torch.Tensor = m.Bs[idx]
+
+    #         guided_numerator, guided_denominator = None, None
+
+    #         if self.loss_type == "kl-divergence":
+    #             guided_numerator = (
+    #                 self.lam[idx]
+    #                 * B.T
+    #                 @ (Y_batch / torch.clamp(B @ H_batch, min=self.eps))
+    #             )
+    #             guided_denominator = self.lam[idx] * B.T @ torch.ones_like(Y_batch)
+    #         else:
+    #             guided_numerator = 2 * self.lam[idx] * B.T @ Y_batch
+    #             guided_denominator = 2 * self.lam[idx] * B.T @ (B @ H_batch)
+
+    #         # combine the guided and unguided parts
+    #         numerator = unguided_numerator + guided_numerator
+    #         denominator = unguided_denominator + guided_denominator
+    #         denominator = torch.clamp(denominator, min=self.eps)
+
+    #         m.Hs[idx][:, batch_indices] *= numerator / denominator
+    #     else:
+    #         m.Hs[idx][:, batch_indices] *= unguided_numerator / unguided_denominator
+
+    # def _fit(self, m: AlpineMatrices) -> None:
+    #     loss_history: List[List[float]] = []
+
+    #     # setting progress bar
+    #     pbar = (
+    #         tqdm(total=self.max_iter, desc="Iteration", ncols=100)
+    #         if self.verbose
+    #         else nullcontext()
+    #     )
+
+    #     joint_labels = create_joint_labels_from_dummy_matrices(m.Ys)
+
+    #     # main loop
+    #     with torch.no_grad():
+    #         with pbar:
+    #             for i_iter in range(self.max_iter):
+    #                 # Generate indices for the entire epoch
+    #                 epoch_indices = generate_epoch_indices(
+    #                     joint_labels=joint_labels,
+    #                     sampling_method=self.sampling_method,
+    #                     device=self.device,
+    #                 )
+
+    #                 # calculate how many batches needed
+    #                 num_batches = get_num_batches(len(epoch_indices), self.batch_size)
+
+    #                 # iterate all batch
+    #                 for batch_num in range(num_batches):
+    #                     # get batch indices
+    #                     batch_indices = get_batch_indices(
+    #                         epoch_indices, batch_num, self.batch_size
+    #                     )
+    #                     # if there are no batch indices, break
+    #                     if len(batch_indices) == 0:
+    #                         break
+
+    #                     # update the matrices
+    #                     if self.use_als:
+    #                         for idx in range(len(self.n_all_components)):
+    #                             self._als_update_Ws(m, batch_indices, idx)
+    #                             if idx < len(self.n_covariate_components):
+    #                                 self._als_update_Bs(m, batch_indices, idx)
+    #                             self._als_update_Hs(m, batch_indices, idx)
+    #                     else:
+    #                         self._update_W(m, batch_indices)
+    #                         self._update_B(m, batch_indices)
+    #                         self._update_H(m, batch_indices)
+
+    #                 # compute loss
+    #                 loss = self._compute_loss(m)
+    #                 loss_history.append(loss)
+
+    #                 if self.verbose:
+    #                     pbar.set_postfix({"objective loss": loss[0]})  # type: ignore
+    #                     pbar.update(1)  # type: ignore
+
+    #             colnames = ["total loss", "reconstruction loss"] + [
+    #                 f"prediction loss({k})" for k in self.covariate_keys
+    #             ]
+    #             self.loss_history = pd.DataFrame(loss_history, columns=colnames)
