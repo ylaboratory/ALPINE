@@ -6,7 +6,6 @@ import pandas as pd
 import anndata as ad
 import scanpy as sc
 import numpy.typing as npt
-from scipy.stats import zscore, norm
 
 from kneed import KneeLocator
 from tqdm import tqdm

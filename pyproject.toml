@@ -1,6 +1,6 @@
 [project]
 name = "alpine"
-version = "0.1.0"
+version = "0.2.0"
 description = "ALPINE is a semi-supervised non-negative matrix factorization (NMF) framework designed to effectively distinguish between multiple phenotypic conditions based on shared biological factors, while also providing direct interpretability of condition-associated genes."
 authors = [
     { name = "Wei-Hao Lee", email = "steve24563@gmail.com" },
